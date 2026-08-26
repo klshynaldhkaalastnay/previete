@@ -53,6 +53,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+          pkill -f cloudflared 2>/dev/null || true
           if command -v docker >/dev/null 2>&1; then
             sudo docker rm -f playit-minecraft 2>/dev/null || true
           fi
@@ -169,14 +170,11 @@ jobs:
 
           echo "[Launcher] Resolving NeoForge launch configuration..."
 
-          # Find the Source 2 unix_args file containing net.neoforged.fml
           NEO_ARGS="$(find . -name "unix_args.txt" -exec grep -l "net.neoforged.fml" {} + 2>/dev/null | head -n 1 || true)"
 
           if [ -n "$NEO_ARGS" ]; then
             echo "[Launcher] Found NeoForge args at: $NEO_ARGS"
 
-            # Create a sanitized args file that handles path prefixes properly
-            # If libraries are at ./libraries instead of ./jar/libraries, fix the paths
             if [ -d "libraries" ] && [ ! -d "jar/libraries" ]; then
               echo "[Launcher] Remapping jar/libraries -> libraries in args..."
               sed 's|jar/libraries/|libraries/|g' "$NEO_ARGS" > neo_args_clean.txt
@@ -184,7 +182,6 @@ jobs:
               cp "$NEO_ARGS" neo_args_clean.txt
             fi
 
-            # Ensure any expected directory structure exists
             mkdir -p jar
             if [ -d "libraries" ] && [ ! -e "jar/libraries" ]; then
               ln -s ../libraries jar/libraries 2>/dev/null || true
@@ -249,6 +246,26 @@ jobs:
           fi
 
           echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Start Cloudflare Tunnel for BlueMap
+        shell: bash
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_TUNNEL_TOKEN not configured, skipping permanent web tunnel."
+            exit 0
+          fi
+
+          echo "Installing Cloudflared daemon..."
+          curl -sLo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+
+          echo "Starting named tunnel for BlueMap..."
+          ./cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /dev/null 2>&1 &
+          sleep 2
 
       - name: Run Minecraft for up to 5 hours 30 minutes
         id: minecraft
@@ -339,7 +356,6 @@ jobs:
             sleep 0.5
           done
 
-          # Default to exit code 0 if process closed cleanly after flush/save
           SERVER_EXIT="$(cat .server-exit-code 2>/dev/null || echo 0)"
 
           cleanup_tail
@@ -397,11 +413,9 @@ jobs:
           CURRENT_KEY="minecraft-${{ runner.os }}-${{ github.run_id }}"
           echo "Preserving current cache: $CURRENT_KEY"
 
-          # Fetch all caches with matching prefix
           CACHES_JSON="$(gh api -H "Accept: application/vnd.github+json" \
             "/repos/${GITHUB_REPOSITORY}/actions/caches?key=minecraft-${{ runner.os }}-" 2>/dev/null || echo '{"actions_caches":[]}')"
 
-          # Extract IDs for any cache other than the one just created
           OLD_CACHE_IDS="$(echo "$CACHES_JSON" | jq -r --arg CURR "$CURRENT_KEY" '.actions_caches[]? | select(.key != $CURR) | .id')"
 
           if [ -z "$OLD_CACHE_IDS" ]; then
@@ -417,10 +431,11 @@ jobs:
             echo "Old caches pruned successfully."
           fi
 
-      - name: Stop Playit tunnel
+      - name: Stop background services
         if: always()
         shell: bash
         run: |
+          pkill -f cloudflared 2>/dev/null || true
           if command -v docker >/dev/null 2>&1; then
             sudo docker rm -f playit-minecraft 2>/dev/null || true
           fi
