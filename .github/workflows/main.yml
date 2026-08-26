@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -d server ] && [ -f server/server.properties ] && [ -d server/libraries ]; then
+          if [ -d server ] && [ -f server/server.properties ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Existing Minecraft server found"
           else
@@ -116,71 +116,32 @@ jobs:
         if: steps.server-state.outputs.exists != 'true'
         shell: bash
         env:
-          ZIP_FOLDER: ${{ vars.SERVER_ZIP_FOLDER }}
+          ZIP_FOLDER_SECRET: ${{ secrets.SERVER_ZIP_FOLDER }}
+          ZIP_FOLDER_VAR: ${{ vars.SERVER_ZIP_FOLDER }}
         run: |
           set -Eeuo pipefail
 
-          ZIP_FOLDER="${ZIP_FOLDER:-.}"
+          TARGET_FOLDER="${ZIP_FOLDER_SECRET:-${ZIP_FOLDER_VAR:-van}}"
+          TARGET_FOLDER="${TARGET_FOLDER%/}"
 
           rm -rf server extracted-server
           mkdir -p server extracted-server
 
-          if [ "$ZIP_FOLDER" = "." ]; then
-            echo "Importing server files from ZIP root"
-            unzip -q server-backup.zip -d extracted-server
-            rsync -a extracted-server/ server/
-          else
-            ZIP_FOLDER="${ZIP_FOLDER%/}"
+          echo "Extracting '$TARGET_FOLDER' from backup ZIP..."
+          unzip -q server-backup.zip "$TARGET_FOLDER/*" -d extracted-server
 
-            echo "Importing ZIP folder: $ZIP_FOLDER"
-
-            unzip -q server-backup.zip "$ZIP_FOLDER/*" -d extracted-server
-
-            if [ ! -d "extracted-server/$ZIP_FOLDER" ]; then
-              echo "Could not find '$ZIP_FOLDER' inside the ZIP"
-              echo
-              unzip -l server-backup.zip | head -n 100
-              exit 1
-            fi
-
-            rsync -a "extracted-server/$ZIP_FOLDER/" server/
+          if [ ! -d "extracted-server/$TARGET_FOLDER" ]; then
+            echo "ERROR: Folder '$TARGET_FOLDER' not found inside ZIP archive."
+            unzip -l server-backup.zip | head -n 50
+            exit 1
           fi
 
-          rm -rf extracted-server
-          rm -f server-backup.zip
+          rsync -a "extracted-server/$TARGET_FOLDER/" server/
 
-          ls -la server
+          rm -rf extracted-server server-backup.zip
 
-      - name: Inspect and verify server files
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd server
-
-          echo "=== 1. Root Directory Listing ==="
-          ls -la
-
-          echo -e "\n=== 2. Checking Essential NeoForge Files ==="
-          for file in server.properties eula.txt user_jvm_args.txt; do
-            if [ -f "$file" ]; then
-              echo " [EXISTS] $file"
-            else
-              echo " [MISSING] $file"
-            fi
-          done
-
-          echo -e "\n=== 3. Searching for NeoForge unix_args.txt ==="
-          find libraries/net/neoforged -type f -name "*args.txt" 2>/dev/null || echo "No args.txt found under libraries/net/neoforged"
-
-          echo -e "\n=== 4. Checking Java / NeoForge Jar Launchers ==="
-          find . -maxdepth 2 -name "*.jar" -o -name "run.sh" 2>/dev/null
-
-          echo -e "\n=== 5. Contents of user_jvm_args.txt (if present) ==="
-          if [ -f "user_jvm_args.txt" ]; then
-            cat user_jvm_args.txt
-          else
-            echo "No user_jvm_args.txt found."
-          fi
+          echo "=== Successfully extracted files to server root ==="
+          ls -la server/
 
       - name: Accept Minecraft EULA
         shell: bash
@@ -194,56 +155,41 @@ jobs:
           set -Eeuo pipefail
           cd server
 
-          # Sanitize user_jvm_args.txt from Apex (remove excessive heap or bad arguments)
-          if [ -f "user_jvm_args.txt" ]; then
-            sed -i '/-Xm[sx]/d' user_jvm_args.txt || true
-          fi
-
           cat > launch-server.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
-          echo "[Launcher] Starting NeoForge launch script in $(pwd)..."
+          JVM_ARGS="-Xms2G -Xmx6G"
 
-          # 1. Check for standard run.sh
+          # 1. Standard run.sh
           if [ -f "run.sh" ]; then
-            echo "[Launcher] Executing run.sh..."
+            echo "[Launcher] Launching via run.sh"
             exec bash run.sh nogui
           fi
 
-          # 2. Locate unix_args.txt (ignoring any jar/ subfolder)
-          NEOFORGE_ARGS="$(
-            find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
-            | grep -v '/jar/' \
-            | sort -V \
-            | tail -n 1
-          )"
-
-          if [ -z "$NEOFORGE_ARGS" ]; then
-            NEOFORGE_ARGS="$(
-              find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
-              | sort -V \
-              | tail -n 1
-            )"
+          # 2. Apex Hosting jar wrapper
+          APEX_JAR="$(find jar -maxdepth 1 -name "*.jar" 2>/dev/null | head -n 1)"
+          if [ -n "$APEX_JAR" ]; then
+            echo "[Launcher] Launching Apex NeoForge jar: $APEX_JAR"
+            exec java $JVM_ARGS -jar "$APEX_JAR" nogui
           fi
 
-          if [ -z "$NEOFORGE_ARGS" ]; then
-            echo "[Launcher] ERROR: Could not locate unix_args.txt anywhere inside libraries/net/neoforged"
-            ls -la
-            ls -la libraries/net/neoforged/ 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "[Launcher] Using arguments: $NEOFORGE_ARGS"
-
-          JVM_ARGS="-Xms2G -Xmx6G"
-          if [ -f "user_jvm_args.txt" ]; then
-            echo "[Launcher] Found user_jvm_args.txt:"
-            cat user_jvm_args.txt
-            exec java $JVM_ARGS @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
-          else
+          # 3. unix_args.txt fallback
+          NEOFORGE_ARGS="$(find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null | sort -V | tail -n 1)"
+          if [ -n "$NEOFORGE_ARGS" ]; then
+            echo "[Launcher] Launching via unix_args: $NEOFORGE_ARGS"
             exec java $JVM_ARGS @"$NEOFORGE_ARGS" nogui
           fi
+
+          # 4. Root server.jar fallback
+          if [ -f "server.jar" ]; then
+            echo "[Launcher] Launching server.jar"
+            exec java $JVM_ARGS -jar server.jar nogui
+          fi
+
+          echo "[Launcher] ERROR: No valid launcher found (no run.sh, jar/*.jar, or unix_args.txt)."
+          ls -la
+          exit 1
           SCRIPT
 
           chmod +x launch-server.sh
@@ -312,7 +258,6 @@ jobs:
           : > workflow-current.log
           rm -f .server-exit-code
 
-          # Launch with absolute path to ensure working directory is preserved
           tmux new-session -d -s "$TMUX_SESSION" "bash -c 'cd \"$GITHUB_WORKSPACE/server\" && ./run-with-exit-code.sh'"
 
           tail -n 0 -F workflow-current.log 2>/dev/null &
@@ -412,8 +357,6 @@ jobs:
             fi
 
             echo "==================================================="
-            echo "Server directory contents:"
-            ls -la
             exit "$SERVER_EXIT"
           fi
 
