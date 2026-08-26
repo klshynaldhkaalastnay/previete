@@ -143,11 +143,19 @@ jobs:
           echo "=== Successfully extracted files to server root ==="
           ls -la server/
 
-      - name: Accept Minecraft EULA
+      - name: Accept Minecraft EULA and Sanitize Server Config
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf 'eula=true\n' > server/eula.txt
+          cd server
+          printf 'eula=true\n' > eula.txt
+
+          # Fix Apex Hosting hardcoded server IP and ports
+          if [ -f "server.properties" ]; then
+            echo "Sanitizing server.properties IP and port bindings..."
+            sed -i 's/^server-ip=.*/server-ip=/' server.properties
+            sed -i 's/^server-port=.*/server-port=25565/' server.properties
+          fi
 
       - name: Build NeoForge launcher
         shell: bash
@@ -155,11 +163,11 @@ jobs:
           set -Eeuo pipefail
           cd server
 
-          # If the shim jar is inside a subfolder (like mc_* or jar/), bring it to root
+          # Copy shim jar to root if present in subdirectories
           SHIM_JAR="$(find . -maxdepth 3 -name "*shim.jar" -o -name "neoforge-*-server.jar" 2>/dev/null | head -n 1)"
           if [ -n "$SHIM_JAR" ] && [ "$(dirname "$SHIM_JAR")" != "." ]; then
             echo "Found shim/server jar at $SHIM_JAR, copying to root..."
-            cp "$SHIM_JAR" ./
+            cp -f "$SHIM_JAR" ./
           fi
 
           cat > launch-server.sh <<'SCRIPT'
@@ -170,19 +178,15 @@ jobs:
 
           echo "[Launcher] Resolving NeoForge runtime files..."
 
-          # 1. Standard run.sh if present
           if [ -f "run.sh" ]; then
             echo "[Launcher] Launching via run.sh"
             exec bash run.sh nogui
           fi
 
-          # 2. Check for unix_args.txt
           NEOFORGE_ARGS="$(find libraries -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
           
           if [ -n "$NEOFORGE_ARGS" ]; then
             echo "[Launcher] Found NeoForge args at: $NEOFORGE_ARGS"
-            
-            # Check what jar unix_args.txt is trying to invoke
             TARGET_JAR="$(grep -oE '[^ ]+\-shim\.jar|[^ ]+neoforge[^ ]+\.jar' "$NEOFORGE_ARGS" | head -n 1 || true)"
             if [ -n "$TARGET_JAR" ] && [ ! -f "$TARGET_JAR" ]; then
               echo "[Launcher] unix_args references '$TARGET_JAR', searching for it..."
@@ -196,7 +200,6 @@ jobs:
             exec java $JVM_ARGS @"$NEOFORGE_ARGS" nogui
           fi
 
-          # 3. Direct jar fallback
           REAL_JAR="$(find mc_* versions -type f -name "*.jar" 2>/dev/null | grep -v 'minecraft-client' | head -n 1)"
           if [ -n "$REAL_JAR" ]; then
             echo "[Launcher] Launching versioned NeoForge jar: $REAL_JAR"
@@ -424,13 +427,24 @@ jobs:
               }'
           )"
 
+          # Query GitHub API to get the exact workflow ID for this run
+          WORKFLOW_ID="$(
+            curl -s \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            | jq -r '.workflow_id'
+          )"
+
+          echo "Triggering continuous workflow session for Workflow ID: $WORKFLOW_ID"
+
           curl \
             --fail-with-body \
             --request POST \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/minecraft-neoforge-server.yml/dispatches" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
             --data "$BODY"
 
       - name: Final cleanup
