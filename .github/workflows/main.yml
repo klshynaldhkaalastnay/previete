@@ -167,7 +167,11 @@ jobs:
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
-          # Locate the versioned unix_args.txt file
+          if [ -f "run.sh" ]; then
+            echo "Launching NeoForge using run.sh"
+            exec bash run.sh nogui
+          fi
+
           NEOFORGE_ARGS="$(
             find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
             | grep -v '/jar/' \
@@ -175,7 +179,6 @@ jobs:
             | tail -n 1
           )"
 
-          # Fallback if no non-jar folder was matched
           if [ -z "$NEOFORGE_ARGS" ]; then
             NEOFORGE_ARGS="$(
               find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
@@ -192,7 +195,10 @@ jobs:
 
           echo "Found NeoForge args at: $NEOFORGE_ARGS"
 
+          # Check if user_jvm_args.txt has invalid memory settings or overrides
           if [ -f "user_jvm_args.txt" ]; then
+            echo "Using user_jvm_args.txt:"
+            cat user_jvm_args.txt
             exec java @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
           else
             exec java -Xms2G -Xmx6G @"$NEOFORGE_ARGS" nogui
@@ -203,13 +209,11 @@ jobs:
 
           cat > run-with-exit-code.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          ./launch-server.sh
-          code=$?
+          ./launch-server.sh 2>&1 | tee -a workflow-current.log
+          code=${PIPESTATUS[0]}
           printf '%s\n' "$code" > .server-exit-code
           exit "$code"
           SCRIPT
-
-          chmod +x run-with-exit-code.sh
 
           chmod +x run-with-exit-code.sh
 
@@ -261,16 +265,12 @@ jobs:
 
           cd server
 
-          # Safely kill any preexisting session
           tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
           : > workflow-current.log
           rm -f .server-exit-code
 
-          # Start session and pipe output safely
           tmux new-session -d -s "$TMUX_SESSION" "cd '$PWD' && ./run-with-exit-code.sh"
-          sleep 1
-          tmux pipe-pane -t "$TMUX_SESSION:0.0" -o "cat >> '$PWD/workflow-current.log'" 2>/dev/null || true
 
           tail -n 0 -F workflow-current.log 2>/dev/null &
           TAIL_PID=$!
@@ -356,7 +356,21 @@ jobs:
           echo "Server exit code: $SERVER_EXIT"
 
           if [ "$SERVER_EXIT" -ne 0 ]; then
-            echo "NeoForge appears to have crashed. Check logs above."
+            echo "=================== WORKFLOW LOG ==================="
+            cat workflow-current.log || true
+            
+            if [ -f "logs/latest.log" ]; then
+              echo "=================== LATEST.LOG ==================="
+              tail -n 100 logs/latest.log || true
+            fi
+
+            if [ -d "crash-reports" ]; then
+              echo "=================== CRASH REPORT ==================="
+              cat crash-reports/* 2>/dev/null || true
+            fi
+
+            echo "==================================================="
+            echo "NeoForge appears to have crashed."
             exit "$SERVER_EXIT"
           fi
 
