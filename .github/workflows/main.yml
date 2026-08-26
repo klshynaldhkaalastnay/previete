@@ -169,7 +169,7 @@ jobs:
           if [ -n "$VC_CONF" ]; then
             echo "Updating Voice Chat configuration at $VC_CONF..."
             sed -i 's/^bind_address=.*/bind_address=0.0.0.0/' "$VC_CONF"
-            sed -i 's/^voice_host=.*/voice_host=YOUR_PLAYIT_VOICE_DOMAIN:PORT/' "$VC_CONF"
+            sed -i 's/^voice_host=.*/voice_host=olds-mama.tun.ply.gg:42520/' "$VC_CONF"
             sed -i 's/^port=.*/port=7829/' "$VC_CONF"
           fi
 
