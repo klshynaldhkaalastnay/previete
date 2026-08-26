@@ -164,37 +164,55 @@ jobs:
 
           cat > launch-server.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          set -Eeuo pipefail
+          # Do not use set -e here so search commands don't abort before running java
 
           JVM_ARGS="-Xms2G -Xmx6G"
 
-          echo "[Launcher] Starting NeoForge launch script..."
+          echo "[Launcher] Starting launch script in $(pwd)..."
 
-          # 1. Look for true NeoForge unix_args
-          NEO_ARGS="$(find libraries/net/neoforged/neoforge -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
-
-          if [ -z "$NEO_ARGS" ]; then
-            NEO_ARGS="$(find libraries -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
+          # 1. Standard run.sh if present
+          if [ -f "run.sh" ]; then
+            echo "[Launcher] Launching via run.sh"
+            exec bash run.sh nogui
           fi
 
+          # 2. Find any unix_args.txt file under libraries
+          NEO_ARGS="$(find libraries -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1 || true)"
+
           if [ -n "$NEO_ARGS" ]; then
-            echo "[Launcher] Executing with args file: $NEO_ARGS"
+            echo "[Launcher] Using args file: $NEO_ARGS"
 
             # Check if unix_args references any specific shim or server jar
-            TARGET_JAR="$(grep -oE '[^ ]+\-shim\.jar|[^ ]+neoforge[^ ]+\.jar' "$NEO_ARGS" | head -n 1 || true)"
+            TARGET_JAR="$(grep -oE '[^ @]+\-shim\.jar|[^ @]+neoforge[^ @]+\.jar' "$NEO_ARGS" | head -n 1 || true)"
             if [ -n "$TARGET_JAR" ] && [ ! -f "$TARGET_JAR" ]; then
-              FOUND_TARGET="$(find . -name "$TARGET_JAR" 2>/dev/null | head -n 1)"
+              FOUND_TARGET="$(find . -name "$TARGET_JAR" 2>/dev/null | head -n 1 || true)"
               if [ -n "$FOUND_TARGET" ]; then
                 echo "[Launcher] Linking $FOUND_TARGET -> ./$TARGET_JAR"
                 cp -f "$FOUND_TARGET" "./$TARGET_JAR"
               fi
             fi
 
-            java $JVM_ARGS @"$NEO_ARGS" nogui
-            exit $?
+            # Check if mods are located in a subfolder and link them to root
+            if [ ! -d "mods" ] || [ -z "$(ls -A mods 2>/dev/null)" ]; then
+              SUB_MODS="$(find . -maxdepth 3 -type d -name "mods" 2>/dev/null | grep -v '^\./mods$' | head -n 1 || true)"
+              if [ -n "$SUB_MODS" ]; then
+                echo "[Launcher] Found mods inside $SUB_MODS, copying to root ./mods..."
+                mkdir -p mods
+                cp -rn "$SUB_MODS"/* mods/ 2>/dev/null || true
+              fi
+            fi
+
+            exec java $JVM_ARGS @"$NEO_ARGS" nogui
           fi
 
-          echo "[Launcher] ERROR: Could not locate unix_args.txt"
+          # 3. Direct jar fallback inside versions/mc_*
+          REAL_JAR="$(find mc_* versions -type f -name "*.jar" 2>/dev/null | grep -v 'minecraft-client' | head -n 1 || true)"
+          if [ -n "$REAL_JAR" ]; then
+            echo "[Launcher] Launching versioned jar: $REAL_JAR"
+            exec java $JVM_ARGS -jar "$REAL_JAR" nogui
+          fi
+
+          echo "[Launcher] ERROR: Could not locate unix_args.txt or server jar."
           exit 1
           SCRIPT
 
@@ -202,7 +220,7 @@ jobs:
 
           cat > run-with-exit-code.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          ./launch-server.sh 2>&1 | tee workflow-current.log
+          ./launch-server.sh 2>&1 | tee -a workflow-current.log
           code=${PIPESTATUS[0]}
           echo "$code" > .server-exit-code
           exit "$code"
