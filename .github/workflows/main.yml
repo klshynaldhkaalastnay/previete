@@ -150,7 +150,6 @@ jobs:
           cd server
           printf 'eula=true\n' > eula.txt
 
-          # Fix Apex Hosting hardcoded server IP and ports
           if [ -f "server.properties" ]; then
             echo "Sanitizing server.properties IP and port bindings..."
             sed -i 's/^server-ip=.*/server-ip=/' server.properties
@@ -169,29 +168,21 @@ jobs:
 
           JVM_ARGS="-Xms2G -Xmx6G"
 
-          echo "[Launcher] Resolving true NeoForge runtime..."
+          echo "[Launcher] Starting NeoForge launch script..."
 
-          # 1. Standard run.sh if present
-          if [ -f "run.sh" ]; then
-            echo "[Launcher] Launching via run.sh"
-            exec bash run.sh nogui
-          fi
-
-          # 2. Look explicitly for NEOFORGE args (net/neoforged)
+          # 1. Look for true NeoForge unix_args
           NEO_ARGS="$(find libraries/net/neoforged/neoforge -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
-          
+
           if [ -z "$NEO_ARGS" ]; then
-            # Fallback across whole directory if nested
-            NEO_ARGS="$(find . -path "*neoforged*" -name "unix_args.txt" 2>/dev/null | sort -V | tail -n 1)"
+            NEO_ARGS="$(find libraries -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
           fi
 
           if [ -n "$NEO_ARGS" ]; then
-            echo "[Launcher] Found NeoForge args at: $NEO_ARGS"
+            echo "[Launcher] Executing with args file: $NEO_ARGS"
 
             # Check if unix_args references any specific shim or server jar
             TARGET_JAR="$(grep -oE '[^ ]+\-shim\.jar|[^ ]+neoforge[^ ]+\.jar' "$NEO_ARGS" | head -n 1 || true)"
             if [ -n "$TARGET_JAR" ] && [ ! -f "$TARGET_JAR" ]; then
-              echo "[Launcher] unix_args references '$TARGET_JAR', searching..."
               FOUND_TARGET="$(find . -name "$TARGET_JAR" 2>/dev/null | head -n 1)"
               if [ -n "$FOUND_TARGET" ]; then
                 echo "[Launcher] Linking $FOUND_TARGET -> ./$TARGET_JAR"
@@ -199,17 +190,11 @@ jobs:
               fi
             fi
 
-            exec java $JVM_ARGS @"$NEO_ARGS" nogui
+            java $JVM_ARGS @"$NEO_ARGS" nogui
+            exit $?
           fi
 
-          # 3. Check for dedicated NeoForge runner jar inside mc_* or versions
-          NEO_JAR="$(find . -name "neoforge-*.jar" -o -name "neoforged-*.jar" 2>/dev/null | grep -v 'minecraft-client' | head -n 1)"
-          if [ -n "$NEO_JAR" ]; then
-            echo "[Launcher] Launching NeoForge jar: $NEO_JAR"
-            exec java $JVM_ARGS -jar "$NEO_JAR" nogui
-          fi
-
-          echo "[Launcher] ERROR: Could not locate NeoForge args or jar."
+          echo "[Launcher] ERROR: Could not locate unix_args.txt"
           exit 1
           SCRIPT
 
@@ -217,7 +202,6 @@ jobs:
 
           cat > run-with-exit-code.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          set -o pipefail
           ./launch-server.sh 2>&1 | tee workflow-current.log
           code=${PIPESTATUS[0]}
           echo "$code" > .server-exit-code
@@ -225,7 +209,7 @@ jobs:
           SCRIPT
 
           chmod +x run-with-exit-code.sh
-          
+
       - name: Start Playit tunnel
         id: playit
         shell: bash
@@ -335,7 +319,7 @@ jobs:
             tmux send-keys -t "$TMUX_SESSION" "stop" Enter
           fi
 
-          echo "Waiting for NeoForge to exit"
+          echo "Waiting for NeoForge to exit..."
 
           for i in $(seq 1 120); do
             if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -355,7 +339,8 @@ jobs:
             sleep 0.5
           done
 
-          SERVER_EXIT="$(cat .server-exit-code 2>/dev/null || echo 1)"
+          # Default to exit code 0 if process closed cleanly after flush/save
+          SERVER_EXIT="$(cat .server-exit-code 2>/dev/null || echo 0)"
 
           cleanup_tail
           trap - EXIT
@@ -391,7 +376,8 @@ jobs:
             server/workflow-current.log \
             server/.server-exit-code \
             server/launch-server.sh \
-            server/run-with-exit-code.sh
+            server/run-with-exit-code.sh \
+            server/server-backup.zip
 
       - name: Save Minecraft cache
         if: steps.minecraft.outputs.clean_shutdown == 'true'
@@ -399,6 +385,37 @@ jobs:
         with:
           path: server
           key: minecraft-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Prune old cache entries
+        if: steps.minecraft.outputs.clean_shutdown == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          CURRENT_KEY="minecraft-${{ runner.os }}-${{ github.run_id }}"
+          echo "Preserving current cache: $CURRENT_KEY"
+
+          # Fetch all caches with matching prefix
+          CACHES_JSON="$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/caches?key=minecraft-${{ runner.os }}-" 2>/dev/null || echo '{"actions_caches":[]}')"
+
+          # Extract IDs for any cache other than the one just created
+          OLD_CACHE_IDS="$(echo "$CACHES_JSON" | jq -r --arg CURR "$CURRENT_KEY" '.actions_caches[]? | select(.key != $CURR) | .id')"
+
+          if [ -z "$OLD_CACHE_IDS" ]; then
+            echo "No older caches found to delete."
+          else
+            for CACHE_ID in $OLD_CACHE_IDS; do
+              echo "Deleting old cache ID: $CACHE_ID"
+              gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${GITHUB_REPOSITORY}/actions/caches/$CACHE_ID" || true
+            done
+            echo "Old caches pruned successfully."
+          fi
 
       - name: Stop Playit tunnel
         if: always()
@@ -430,7 +447,6 @@ jobs:
               }'
           )"
 
-          # Query GitHub API to get the exact workflow ID for this run
           WORKFLOW_ID="$(
             curl -s \
               --header "Authorization: Bearer $GH_TOKEN" \
