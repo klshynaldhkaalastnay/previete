@@ -167,27 +167,30 @@ jobs:
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
-          if [ -f "run.sh" ]; then
-            echo "Launching NeoForge using run.sh"
-            exec bash run.sh nogui
-          fi
-
+          # Locate the versioned unix_args.txt file
           NEOFORGE_ARGS="$(
-            find libraries/net/neoforged/neoforge \
-              -type f \
-              -name unix_args.txt \
-              2>/dev/null \
+            find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
+            | grep -v '/jar/' \
             | sort -V \
             | tail -n 1
           )"
 
+          # Fallback if no non-jar folder was matched
           if [ -z "$NEOFORGE_ARGS" ]; then
-            echo "ERROR: NeoForge unix_args.txt could not be found"
-            find libraries/net/neoforged -maxdepth 6 -type f 2>/dev/null || true
+            NEOFORGE_ARGS="$(
+              find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
+              | sort -V \
+              | tail -n 1
+            )"
+          fi
+
+          if [ -z "$NEOFORGE_ARGS" ]; then
+            echo "ERROR: Could not locate unix_args.txt"
+            find libraries/net/neoforged -maxdepth 6 2>/dev/null || true
             exit 1
           fi
 
-          echo "NeoForge arguments: $NEOFORGE_ARGS"
+          echo "Found NeoForge args at: $NEOFORGE_ARGS"
 
           if [ -f "user_jvm_args.txt" ]; then
             exec java @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
@@ -200,12 +203,13 @@ jobs:
 
           cat > run-with-exit-code.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          set +e
           ./launch-server.sh
           code=$?
           printf '%s\n' "$code" > .server-exit-code
           exit "$code"
           SCRIPT
+
+          chmod +x run-with-exit-code.sh
 
           chmod +x run-with-exit-code.sh
 
@@ -257,21 +261,18 @@ jobs:
 
           cd server
 
+          # Safely kill any preexisting session
           tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
           : > workflow-current.log
           rm -f .server-exit-code
 
-          tmux new-session \
-            -d \
-            -s "$TMUX_SESSION" \
-            "cd '$PWD' && ./run-with-exit-code.sh"
+          # Start session and pipe output safely
+          tmux new-session -d -s "$TMUX_SESSION" "cd '$PWD' && ./run-with-exit-code.sh"
+          sleep 1
+          tmux pipe-pane -t "$TMUX_SESSION:0.0" -o "cat >> '$PWD/workflow-current.log'" 2>/dev/null || true
 
-          tmux pipe-pane \
-            -t "$TMUX_SESSION:0.0" \
-            -o "cat >> '$PWD/workflow-current.log'"
-
-          tail -n 0 -F workflow-current.log &
+          tail -n 0 -F workflow-current.log 2>/dev/null &
           TAIL_PID=$!
 
           cleanup_tail() {
@@ -298,7 +299,7 @@ jobs:
               break
             fi
 
-            if grep -Fq "<$RESTART_USER> $RESTART_COMMAND" workflow-current.log; then
+            if grep -Fq "<$RESTART_USER> $RESTART_COMMAND" workflow-current.log 2>/dev/null; then
               RESTART_REASON="chat-command"
               echo "Restart requested in chat by $RESTART_USER"
               break
@@ -315,22 +316,14 @@ jobs:
 
           if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
             if [ "$RESTART_REASON" = "chat-command" ]; then
-              tmux send-keys \
-                -t "$TMUX_SESSION" \
-                "say Restart requested by $RESTART_USER, restarting server" \
-                Enter
+              tmux send-keys -t "$TMUX_SESSION" "say Restart requested by $RESTART_USER, restarting server" Enter
             else
-              tmux send-keys \
-                -t "$TMUX_SESSION" \
-                "say Server restarting shortly" \
-                Enter
+              tmux send-keys -t "$TMUX_SESSION" "say Server restarting shortly" Enter
             fi
 
             sleep 2
-
             tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
             sleep 10
-
             tmux send-keys -t "$TMUX_SESSION" "stop" Enter
           fi
 
@@ -345,6 +338,7 @@ jobs:
 
           if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
             echo "ERROR: NeoForge did not stop within 120 seconds"
+            tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
             exit 1
           fi
 
@@ -362,7 +356,7 @@ jobs:
           echo "Server exit code: $SERVER_EXIT"
 
           if [ "$SERVER_EXIT" -ne 0 ]; then
-            echo "NeoForge appears to have crashed"
+            echo "NeoForge appears to have crashed. Check logs above."
             exit "$SERVER_EXIT"
           fi
 
