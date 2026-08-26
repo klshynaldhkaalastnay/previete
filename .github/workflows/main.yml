@@ -151,6 +151,37 @@ jobs:
 
           ls -la server
 
+      - name: Inspect and verify server files
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd server
+
+          echo "=== 1. Root Directory Listing ==="
+          ls -la
+
+          echo -e "\n=== 2. Checking Essential NeoForge Files ==="
+          for file in server.properties eula.txt user_jvm_args.txt; do
+            if [ -f "$file" ]; then
+              echo " [EXISTS] $file"
+            else
+              echo " [MISSING] $file"
+            fi
+          done
+
+          echo -e "\n=== 3. Searching for NeoForge unix_args.txt ==="
+          find libraries/net/neoforged -type f -name "*args.txt" 2>/dev/null || echo "No args.txt found under libraries/net/neoforged"
+
+          echo -e "\n=== 4. Checking Java / NeoForge Jar Launchers ==="
+          find . -maxdepth 2 -name "*.jar" -o -name "run.sh" 2>/dev/null
+
+          echo -e "\n=== 5. Contents of user_jvm_args.txt (if present) ==="
+          if [ -f "user_jvm_args.txt" ]; then
+            cat user_jvm_args.txt
+          else
+            echo "No user_jvm_args.txt found."
+          fi
+
       - name: Accept Minecraft EULA
         shell: bash
         run: |
@@ -163,15 +194,24 @@ jobs:
           set -Eeuo pipefail
           cd server
 
+          # Sanitize user_jvm_args.txt from Apex (remove excessive heap or bad arguments)
+          if [ -f "user_jvm_args.txt" ]; then
+            sed -i '/-Xm[sx]/d' user_jvm_args.txt || true
+          fi
+
           cat > launch-server.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
+          echo "[Launcher] Starting NeoForge launch script in $(pwd)..."
+
+          # 1. Check for standard run.sh
           if [ -f "run.sh" ]; then
-            echo "Launching NeoForge using run.sh"
+            echo "[Launcher] Executing run.sh..."
             exec bash run.sh nogui
           fi
 
+          # 2. Locate unix_args.txt (ignoring any jar/ subfolder)
           NEOFORGE_ARGS="$(
             find libraries/net/neoforged/neoforge -type f -name unix_args.txt 2>/dev/null \
             | grep -v '/jar/' \
@@ -188,20 +228,21 @@ jobs:
           fi
 
           if [ -z "$NEOFORGE_ARGS" ]; then
-            echo "ERROR: Could not locate unix_args.txt"
-            find libraries/net/neoforged -maxdepth 6 2>/dev/null || true
+            echo "[Launcher] ERROR: Could not locate unix_args.txt anywhere inside libraries/net/neoforged"
+            ls -la
+            ls -la libraries/net/neoforged/ 2>/dev/null || true
             exit 1
           fi
 
-          echo "Found NeoForge args at: $NEOFORGE_ARGS"
+          echo "[Launcher] Using arguments: $NEOFORGE_ARGS"
 
-          # Check if user_jvm_args.txt has invalid memory settings or overrides
+          JVM_ARGS="-Xms2G -Xmx6G"
           if [ -f "user_jvm_args.txt" ]; then
-            echo "Using user_jvm_args.txt:"
+            echo "[Launcher] Found user_jvm_args.txt:"
             cat user_jvm_args.txt
-            exec java @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
+            exec java $JVM_ARGS @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
           else
-            exec java -Xms2G -Xmx6G @"$NEOFORGE_ARGS" nogui
+            exec java $JVM_ARGS @"$NEOFORGE_ARGS" nogui
           fi
           SCRIPT
 
@@ -209,9 +250,10 @@ jobs:
 
           cat > run-with-exit-code.sh <<'SCRIPT'
           #!/usr/bin/env bash
-          ./launch-server.sh 2>&1 | tee -a workflow-current.log
+          set -o pipefail
+          ./launch-server.sh 2>&1 | tee workflow-current.log
           code=${PIPESTATUS[0]}
-          printf '%s\n' "$code" > .server-exit-code
+          echo "$code" > .server-exit-code
           exit "$code"
           SCRIPT
 
@@ -263,14 +305,15 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          cd server
+          cd "$GITHUB_WORKSPACE/server"
 
           tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
           : > workflow-current.log
           rm -f .server-exit-code
 
-          tmux new-session -d -s "$TMUX_SESSION" "cd '$PWD' && ./run-with-exit-code.sh"
+          # Launch with absolute path to ensure working directory is preserved
+          tmux new-session -d -s "$TMUX_SESSION" "bash -c 'cd \"$GITHUB_WORKSPACE/server\" && ./run-with-exit-code.sh'"
 
           tail -n 0 -F workflow-current.log 2>/dev/null &
           TAIL_PID=$!
@@ -283,7 +326,6 @@ jobs:
 
           START_TIME="$(date +%s)"
           END_TIME="$((START_TIME + SESSION_SECONDS))"
-
           RESTART_REASON=""
 
           echo "Minecraft session started"
@@ -356,12 +398,12 @@ jobs:
           echo "Server exit code: $SERVER_EXIT"
 
           if [ "$SERVER_EXIT" -ne 0 ]; then
-            echo "=================== WORKFLOW LOG ==================="
-            cat workflow-current.log || true
+            echo "=================== DIRECT WORKFLOW LOG ==================="
+            cat workflow-current.log 2>/dev/null || echo "No workflow-current.log found"
             
             if [ -f "logs/latest.log" ]; then
               echo "=================== LATEST.LOG ==================="
-              tail -n 100 logs/latest.log || true
+              cat logs/latest.log
             fi
 
             if [ -d "crash-reports" ]; then
@@ -370,7 +412,8 @@ jobs:
             fi
 
             echo "==================================================="
-            echo "NeoForge appears to have crashed."
+            echo "Server directory contents:"
+            ls -la
             exit "$SERVER_EXIT"
           fi
 
