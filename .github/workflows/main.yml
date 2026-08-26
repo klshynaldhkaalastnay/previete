@@ -155,6 +155,13 @@ jobs:
           set -Eeuo pipefail
           cd server
 
+          # If the shim jar is inside a subfolder (like mc_* or jar/), bring it to root
+          SHIM_JAR="$(find . -maxdepth 3 -name "*shim.jar" -o -name "neoforge-*-server.jar" 2>/dev/null | head -n 1)"
+          if [ -n "$SHIM_JAR" ] && [ "$(dirname "$SHIM_JAR")" != "." ]; then
+            echo "Found shim/server jar at $SHIM_JAR, copying to root..."
+            cp "$SHIM_JAR" ./
+          fi
+
           cat > launch-server.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -Eeuo pipefail
@@ -169,29 +176,34 @@ jobs:
             exec bash run.sh nogui
           fi
 
-          # 2. Check for unix_args.txt anywhere across the server (root or mc_* folders)
-          NEOFORGE_ARGS="$(find . -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
+          # 2. Check for unix_args.txt
+          NEOFORGE_ARGS="$(find libraries -type f -name "unix_args.txt" 2>/dev/null | grep -v '/jar/' | sort -V | tail -n 1)"
+          
           if [ -n "$NEOFORGE_ARGS" ]; then
             echo "[Launcher] Found NeoForge args at: $NEOFORGE_ARGS"
+            
+            # Check what jar unix_args.txt is trying to invoke
+            TARGET_JAR="$(grep -oE '[^ ]+\-shim\.jar|[^ ]+neoforge[^ ]+\.jar' "$NEOFORGE_ARGS" | head -n 1 || true)"
+            if [ -n "$TARGET_JAR" ] && [ ! -f "$TARGET_JAR" ]; then
+              echo "[Launcher] unix_args references '$TARGET_JAR', searching for it..."
+              FOUND_TARGET="$(find . -name "$TARGET_JAR" 2>/dev/null | head -n 1)"
+              if [ -n "$FOUND_TARGET" ]; then
+                echo "[Launcher] Linking $FOUND_TARGET to root ./$TARGET_JAR"
+                cp -f "$FOUND_TARGET" "./$TARGET_JAR"
+              fi
+            fi
+
             exec java $JVM_ARGS @"$NEOFORGE_ARGS" nogui
           fi
 
-          # 3. Check for the valid non-empty runnable jar inside mc_* or versions
+          # 3. Direct jar fallback
           REAL_JAR="$(find mc_* versions -type f -name "*.jar" 2>/dev/null | grep -v 'minecraft-client' | head -n 1)"
           if [ -n "$REAL_JAR" ]; then
             echo "[Launcher] Launching versioned NeoForge jar: $REAL_JAR"
             exec java $JVM_ARGS -jar "$REAL_JAR" nogui
           fi
 
-          # 4. Standard server.jar fallback
-          if [ -f "server.jar" ]; then
-            echo "[Launcher] Launching server.jar"
-            exec java $JVM_ARGS -jar server.jar nogui
-          fi
-
-          echo "[Launcher] ERROR: Could not find valid launch arguments or jars."
-          ls -la
-          find . -maxdepth 3 -name "*.jar" -o -name "*args.txt" 2>/dev/null
+          echo "[Launcher] ERROR: Could not resolve startup sequence."
           exit 1
           SCRIPT
 
