@@ -1,0 +1,431 @@
+name: Minecraft NeoForge Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      continue:
+        description: "Start a new 5:30 session after this one ends"
+        required: true
+        default: true
+        type: boolean
+      force_reimport:
+        description: "Ignore cache and import the original ZIP again"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: minecraft-server
+  cancel-in-progress: false
+
+env:
+  SESSION_SECONDS: "19800"
+  RESTART_USER: "realandres99"
+  RESTART_COMMAND: "!restart"
+  TMUX_SESSION: "minecraft"
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 355
+
+    steps:
+      - name: Set up Java 21
+        uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Linux tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq tmux unzip rsync ca-certificates
+
+      - name: Clean stale processes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker rm -f playit-minecraft 2>/dev/null || true
+          fi
+
+      - name: Restore Minecraft cache
+        if: inputs.force_reimport != true
+        id: cache-restore
+        uses: actions/cache/restore@main
+        with:
+          path: server
+          key: minecraft-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            minecraft-${{ runner.os }}-
+
+      - name: Prepare forced re-import
+        if: inputs.force_reimport == true
+        shell: bash
+        run: |
+          rm -rf server
+
+      - name: Check server files
+        id: server-state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -d server ] && [ -f server/server.properties ] && [ -d server/libraries ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Existing Minecraft server found"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No usable cached server found"
+          fi
+
+      - name: Download original server ZIP
+        if: steps.server-state.outputs.exists != 'true'
+        shell: bash
+        env:
+          SERVER_ZIP_URL: ${{ secrets.SERVER_ZIP_URL }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${SERVER_ZIP_URL:-}" ]; then
+            echo "SERVER_ZIP_URL is not set"
+            echo "Create it under Settings -> Secrets and variables -> Actions -> Secrets"
+            exit 1
+          fi
+
+          rm -f server-backup.zip
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            "$SERVER_ZIP_URL" \
+            --output server-backup.zip
+
+          ls -lh server-backup.zip
+
+      - name: Import server from ZIP
+        if: steps.server-state.outputs.exists != 'true'
+        shell: bash
+        env:
+          ZIP_FOLDER: ${{ vars.SERVER_ZIP_FOLDER }}
+        run: |
+          set -Eeuo pipefail
+
+          ZIP_FOLDER="${ZIP_FOLDER:-.}"
+
+          rm -rf server extracted-server
+          mkdir -p server extracted-server
+
+          if [ "$ZIP_FOLDER" = "." ]; then
+            echo "Importing server files from ZIP root"
+            unzip -q server-backup.zip -d extracted-server
+            rsync -a extracted-server/ server/
+          else
+            ZIP_FOLDER="${ZIP_FOLDER%/}"
+
+            echo "Importing ZIP folder: $ZIP_FOLDER"
+
+            unzip -q server-backup.zip "$ZIP_FOLDER/*" -d extracted-server
+
+            if [ ! -d "extracted-server/$ZIP_FOLDER" ]; then
+              echo "Could not find '$ZIP_FOLDER' inside the ZIP"
+              echo
+              unzip -l server-backup.zip | head -n 100
+              exit 1
+            fi
+
+            rsync -a "extracted-server/$ZIP_FOLDER/" server/
+          fi
+
+          rm -rf extracted-server
+          rm -f server-backup.zip
+
+          ls -la server
+
+      - name: Accept Minecraft EULA
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf 'eula=true\n' > server/eula.txt
+
+      - name: Build NeoForge launcher
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd server
+
+          cat > launch-server.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          if [ -f "run.sh" ]; then
+            echo "Launching NeoForge using run.sh"
+            exec bash run.sh nogui
+          fi
+
+          NEOFORGE_ARGS="$(
+            find libraries/net/neoforged/neoforge \
+              -type f \
+              -name unix_args.txt \
+              2>/dev/null \
+            | sort -V \
+            | tail -n 1
+          )"
+
+          if [ -z "$NEOFORGE_ARGS" ]; then
+            echo "ERROR: NeoForge unix_args.txt could not be found"
+            find libraries/net/neoforged -maxdepth 6 -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "NeoForge arguments: $NEOFORGE_ARGS"
+
+          if [ -f "user_jvm_args.txt" ]; then
+            exec java @user_jvm_args.txt @"$NEOFORGE_ARGS" nogui
+          else
+            exec java -Xms2G -Xmx6G @"$NEOFORGE_ARGS" nogui
+          fi
+          SCRIPT
+
+          chmod +x launch-server.sh
+
+          cat > run-with-exit-code.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set +e
+          ./launch-server.sh
+          code=$?
+          printf '%s\n' "$code" > .server-exit-code
+          exit "$code"
+          SCRIPT
+
+          chmod +x run-with-exit-code.sh
+
+      - name: Start Playit tunnel
+        id: playit
+        shell: bash
+        env:
+          PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${PLAYIT_SECRET_KEY:-}" ]; then
+            echo "PLAYIT_SECRET_KEY is not set, skipping Playit"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+            sudo systemctl enable --now docker
+          fi
+
+          sudo docker rm -f playit-minecraft 2>/dev/null || true
+
+          sudo docker run \
+            -d \
+            --rm \
+            --name playit-minecraft \
+            --network host \
+            -e SECRET_KEY="$PLAYIT_SECRET_KEY" \
+            ghcr.io/playit-cloud/playit-agent:latest
+
+          sleep 5
+
+          if ! sudo docker ps --format '{{.Names}}' | grep -Fxq playit-minecraft; then
+            echo "Playit failed to stay running"
+            sudo docker logs playit-minecraft 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run Minecraft for up to 5 hours 30 minutes
+        id: minecraft
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd server
+
+          tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+
+          : > workflow-current.log
+          rm -f .server-exit-code
+
+          tmux new-session \
+            -d \
+            -s "$TMUX_SESSION" \
+            "cd '$PWD' && ./run-with-exit-code.sh"
+
+          tmux pipe-pane \
+            -t "$TMUX_SESSION:0.0" \
+            -o "cat >> '$PWD/workflow-current.log'"
+
+          tail -n 0 -F workflow-current.log &
+          TAIL_PID=$!
+
+          cleanup_tail() {
+            kill "$TAIL_PID" 2>/dev/null || true
+          }
+
+          trap cleanup_tail EXIT
+
+          START_TIME="$(date +%s)"
+          END_TIME="$((START_TIME + SESSION_SECONDS))"
+
+          RESTART_REASON=""
+
+          echo "Minecraft session started"
+          echo "Maximum session length: 5:30:00"
+          echo "Restart chat command: <$RESTART_USER> $RESTART_COMMAND"
+
+          while true; do
+            NOW="$(date +%s)"
+
+            if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+              RESTART_REASON="server-stopped"
+              echo "Minecraft stopped before the time limit"
+              break
+            fi
+
+            if grep -Fq "<$RESTART_USER> $RESTART_COMMAND" workflow-current.log; then
+              RESTART_REASON="chat-command"
+              echo "Restart requested in chat by $RESTART_USER"
+              break
+            fi
+
+            if [ "$NOW" -ge "$END_TIME" ]; then
+              RESTART_REASON="time-limit"
+              echo "5:30:00 time limit reached"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            if [ "$RESTART_REASON" = "chat-command" ]; then
+              tmux send-keys \
+                -t "$TMUX_SESSION" \
+                "say Restart requested by $RESTART_USER, restarting server" \
+                Enter
+            else
+              tmux send-keys \
+                -t "$TMUX_SESSION" \
+                "say Server restarting shortly" \
+                Enter
+            fi
+
+            sleep 2
+
+            tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
+            sleep 10
+
+            tmux send-keys -t "$TMUX_SESSION" "stop" Enter
+          fi
+
+          echo "Waiting for NeoForge to exit"
+
+          for i in $(seq 1 120); do
+            if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            echo "ERROR: NeoForge did not stop within 120 seconds"
+            exit 1
+          fi
+
+          for i in $(seq 1 20); do
+            [ -f .server-exit-code ] && break
+            sleep 0.5
+          done
+
+          SERVER_EXIT="$(cat .server-exit-code 2>/dev/null || echo 1)"
+
+          cleanup_tail
+          trap - EXIT
+
+          echo "Restart reason: $RESTART_REASON"
+          echo "Server exit code: $SERVER_EXIT"
+
+          if [ "$SERVER_EXIT" -ne 0 ]; then
+            echo "NeoForge appears to have crashed"
+            exit "$SERVER_EXIT"
+          fi
+
+          echo "clean_shutdown=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare server state for cache
+        if: steps.minecraft.outputs.clean_shutdown == 'true'
+        shell: bash
+        run: |
+          rm -f \
+            server/workflow-current.log \
+            server/.server-exit-code \
+            server/launch-server.sh \
+            server/run-with-exit-code.sh
+
+      - name: Save Minecraft cache
+        if: steps.minecraft.outputs.clean_shutdown == 'true'
+        uses: actions/cache/save@main
+        with:
+          path: server
+          key: minecraft-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Stop Playit tunnel
+        if: always()
+        shell: bash
+        run: |
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker rm -f playit-minecraft 2>/dev/null || true
+          fi
+
+      - name: Start next Minecraft session
+        if: |
+          steps.minecraft.outputs.clean_shutdown == 'true' &&
+          inputs.continue == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          BODY="$(
+            jq -n \
+              --arg ref "$GITHUB_REF_NAME" \
+              '{
+                ref: $ref,
+                inputs: {
+                  continue: "true",
+                  force_reimport: "false"
+                }
+              }'
+          )"
+
+          curl \
+            --fail-with-body \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/minecraft-neoforge-server.yml/dispatches" \
+            --data "$BODY"
+
+      - name: Final cleanup
+        if: always()
+        shell: bash
+        run: |
+          tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
