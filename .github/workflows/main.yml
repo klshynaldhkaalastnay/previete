@@ -157,6 +157,22 @@ jobs:
             sed -i 's/^server-port=.*/server-port=25565/' server.properties
           fi
 
+      - name: Configure Simple Voice Chat
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd server
+          
+          # Locate voicechat configuration directory
+          VC_CONF="$(find . -name "voicechat-server.properties" 2>/dev/null | head -n 1 || true)"
+          
+          if [ -n "$VC_CONF" ]; then
+            echo "Updating Voice Chat configuration at $VC_CONF..."
+            sed -i 's/^bind_address=.*/bind_address=0.0.0.0/' "$VC_CONF"
+            sed -i 's/^voice_host=.*/voice_host=YOUR_PLAYIT_VOICE_DOMAIN:PORT/' "$VC_CONF"
+            sed -i 's/^port=.*/port=7829/' "$VC_CONF"
+          fi
+
       - name: Build NeoForge launcher
         shell: bash
         run: |
