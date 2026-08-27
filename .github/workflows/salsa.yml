@@ -26,6 +26,7 @@ env:
   SESSION_SECONDS: "19800"
   RESTART_USER: "realandres99"
   RESTART_COMMAND: "!restart"
+  UPLOAD_COMMAND: "!upload"
   TMUX_SESSION: "salsa"
 
 jobs:
@@ -46,7 +47,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq tmux unzip rsync ca-certificates
+          sudo apt-get install -y curl jq tmux unzip zip rsync ca-certificates awscli
 
       - name: Clean stale processes
         shell: bash
@@ -311,7 +312,9 @@ jobs:
 
           echo "Minecraft session started"
           echo "Maximum session length: 5:30:00"
-          echo "Restart chat command: <$RESTART_USER> $RESTART_COMMAND"
+          echo "Commands monitored from user <$RESTART_USER>:"
+          echo " - Restart: $RESTART_COMMAND"
+          echo " - Backup & Upload to R2: $UPLOAD_COMMAND"
 
           while true; do
             NOW="$(date +%s)"
@@ -319,6 +322,12 @@ jobs:
             if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
               RESTART_REASON="server-stopped"
               echo "Minecraft stopped before the time limit"
+              break
+            fi
+
+            if grep -Fq "<$RESTART_USER> $UPLOAD_COMMAND" workflow-current.log 2>/dev/null; then
+              RESTART_REASON="upload-command"
+              echo "Upload and restart requested in chat by $RESTART_USER"
               break
             fi
 
@@ -338,16 +347,12 @@ jobs:
           done
 
           if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-            echo "Executing server restart command ($RESTART_COMMAND)..."
-            tmux send-keys -t "$TMUX_SESSION" "$RESTART_COMMAND" Enter
-            
-            # Fallback stop sequence in case the custom command doesn't terminate the process
-            sleep 15
-            if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-              tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
-              sleep 5
-              tmux send-keys -t "$TMUX_SESSION" "stop" Enter
-            fi
+            echo "Initiating server shutdown sequence..."
+            tmux send-keys -t "$TMUX_SESSION" "say Server stopping for maintenance/upload..." Enter
+            sleep 2
+            tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
+            sleep 5
+            tmux send-keys -t "$TMUX_SESSION" "stop" Enter
           fi
 
           echo "Waiting for NeoForge to exit..."
@@ -398,7 +403,14 @@ jobs:
 
           echo "clean_shutdown=true" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare server state for cache
+          # Check if the upload command was issued during this session
+          if grep -Fq "<$RESTART_USER> $UPLOAD_COMMAND" workflow-current.log 2>/dev/null; then
+            echo "upload_requested=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload_requested=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare server state for cache & backup
         if: steps.minecraft.outputs.clean_shutdown == 'true'
         shell: bash
         run: |
@@ -408,6 +420,51 @@ jobs:
             server/launch-server.sh \
             server/run-with-exit-code.sh \
             server/server-backup.zip
+
+      - name: Backup Server to Cloudflare R2
+        if: |
+          steps.minecraft.outputs.clean_shutdown == 'true' &&
+          steps.minecraft.outputs.upload_requested == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+          SERVER_ZIP_URL: ${{ secrets.SERVER_ZIP_URL_SALSA }}
+          ZIP_FOLDER_VAR: ${{ vars.SERVER_ZIP_FOLDER_SALSA }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET_NAME:-}" ]; then
+            echo "R2 credentials or bucket configuration missing, skipping R2 upload."
+            exit 0
+          fi
+
+          RAW_FILENAME="$(basename "${SERVER_ZIP_URL%%\?*}")"
+          BASE_NAME="${RAW_FILENAME%.zip}"
+          [ -z "$BASE_NAME" ] && BASE_NAME="salsa-server"
+
+          TIMESTAMP="$(date -u +"%Y_%m_%d_%H_%M_%S")"
+          ARCHIVE_NAME="${BASE_NAME}_${TIMESTAMP}.zip"
+
+          TARGET_FOLDER="${ZIP_FOLDER_SECRET:-${ZIP_FOLDER_VAR:-van}}"
+          TARGET_FOLDER="${TARGET_FOLDER%/}"
+
+          echo "Creating backup archive: $ARCHIVE_NAME"
+          mkdir -p "backup_staging/$TARGET_FOLDER"
+          rsync -a server/ "backup_staging/$TARGET_FOLDER/"
+          
+          (cd backup_staging && zip -r -q "../$ARCHIVE_NAME" "$TARGET_FOLDER")
+          rm -rf backup_staging
+
+          echo "Uploading $ARCHIVE_NAME to Cloudflare R2 bucket: $R2_BUCKET_NAME..."
+          aws s3 cp "$ARCHIVE_NAME" "s3://${R2_BUCKET_NAME}/${ARCHIVE_NAME}" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          rm -f "$ARCHIVE_NAME"
+          echo "Backup uploaded successfully."
 
       - name: Save Minecraft cache
         if: steps.minecraft.outputs.clean_shutdown == 'true'
