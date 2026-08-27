@@ -340,16 +340,16 @@ jobs:
           done
 
           if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-            if [ "$RESTART_REASON" = "chat-command" ]; then
-              tmux send-keys -t "$TMUX_SESSION" "say Restart requested by $RESTART_USER, restarting server" Enter
-            else
-              tmux send-keys -t "$TMUX_SESSION" "say Server restarting shortly" Enter
+            echo "Executing server restart command ($RESTART_COMMAND)..."
+            tmux send-keys -t "$TMUX_SESSION" "$RESTART_COMMAND" Enter
+            
+            # Fallback stop sequence in case the custom command doesn't terminate the process
+            sleep 15
+            if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+              tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
+              sleep 5
+              tmux send-keys -t "$TMUX_SESSION" "stop" Enter
             fi
-
-            sleep 2
-            tmux send-keys -t "$TMUX_SESSION" "save-all flush" Enter
-            sleep 10
-            tmux send-keys -t "$TMUX_SESSION" "stop" Enter
           fi
 
           echo "Waiting for NeoForge to exit..."
