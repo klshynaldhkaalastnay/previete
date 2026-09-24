@@ -22,7 +22,7 @@ on:
       python_version:
         description: "Python version"
         required: true
-        default: "3.12"
+        default: "3.x"
         type: string
       upload_backup:
         description: "Upload an R2 backup after every successful session"
@@ -57,6 +57,7 @@ jobs:
         uses: actions/setup-python@main
         with:
           python-version: ${{ inputs.python_version }}
+          check-latest: true
 
       - name: Install Linux tools
         run: |
