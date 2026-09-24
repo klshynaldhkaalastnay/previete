@@ -220,6 +220,8 @@ jobs:
 
 
           def install_workflow_hooks(client):
+              if getattr(client, "_workflow_hooks_installed", False):
+                  return client
               # The uploaded bot saves state in /restart, but not in close(). Install
               # the same save operation for timed shutdowns without editing its source.
               save_original = client.save_state
@@ -253,7 +255,12 @@ jobs:
                           async with save_lock:
                               if closing:
                                   return
+                              queued_before = len(client.queued_jobs[user_id])
                               await namespace["check_and_process_queue"](user_id)
+                              if len(client.queued_jobs[user_id]) >= queued_before:
+                                  # Newer bots pause queues while every cookie is disabled.
+                                  # Yield to their cookie poller instead of spinning here.
+                                  break
 
               async def run_delayed_retry(retry_id):
                   task = asyncio.current_task()
@@ -287,11 +294,14 @@ jobs:
                       async with save_lock:
                           if closing or retry_id not in delayed_retries:
                               return
-                          client.queued_jobs[user_id].append((
+                          queued_job = (
                               job["target_url"], job["url_type"], job["is_silent"], message,
                               job.get("guild_id"), user_id, job.get("free_space", False),
                               job.get("batch_id"), job.get("is_bot_request", False)
-                          ))
+                          )
+                          if job.get("is_cookie_retry", False):
+                              queued_job += (True,)
+                          client.queued_jobs[user_id].append(queued_job)
                           # Queue insertion and timer removal are one snapshot change,
                           # so a restart cannot restore this as both queued and waiting.
                           delayed_retries.pop(retry_id)
@@ -323,6 +333,7 @@ jobs:
                           "free_space": context.get("free_space", False),
                           "batch_id": context.get("batch_id"),
                           "is_bot_request": context.get("is_bot_request", False),
+                          "is_cookie_retry": context.get("is_cookie_retry", False),
                           "message_data": {
                               "channel_id": message.channel.id, "message_id": message.id
                           } if message else None
@@ -399,7 +410,7 @@ jobs:
                   try:
                       if initialized:
                           loops = [namespace.get(name) for name in (
-                              "poll_github_runs", "cleanup_expired_exclusions", "upload_logs"
+                              "poll_github_runs", "poll_cookie_secrets", "cleanup_expired_exclusions", "upload_logs"
                           )]
                           loops.append(getattr(client, "update_bot_status", None))
                           pending = []
@@ -442,19 +453,30 @@ jobs:
               client.save_state = save_state
               client.close = close
               namespace["schedule_timeout_retry"] = schedule_timeout_retry
+              client._workflow_hooks_installed = True
+              return client
 
 
           script = Path(sys.argv[1]).resolve()
           tree = ast.parse(script.read_text(encoding="utf-8-sig"), filename=str(script))
-          entry = tree.body[-1] if tree.body else None
-          expected = ast.parse("client.run(DISCORD_TOKEN)").body[0]
-          if entry is None or ast.dump(entry) != ast.dump(expected):
-              raise SystemExit("Expected the uploaded ArchiveBot script ending in client.run(DISCORD_TOKEN).")
-          tree.body.insert(-1, ast.parse("__install_workflow_hooks(client)").body[0])
+          # Find the actual startup call, including a __main__ guard or main()
+          # function. Install hooks on its receiver immediately before it runs.
+          startup_calls = [node for node in ast.walk(tree) if (
+              isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "run" and isinstance(node.func.value, ast.Name)
+              and node.func.value.id == "client"
+          )]
+          if not startup_calls:
+              raise SystemExit(f"No client.run(...) startup call was found in {script.name}; check the python_file input and ZIP contents.")
+          for call in startup_calls:
+              call.func.value = ast.Call(
+                  func=ast.Name(id="_workflow_prepare_client", ctx=ast.Load()),
+                  args=[call.func.value], keywords=[]
+              )
           ast.fix_missing_locations(tree)
           module = types.ModuleType("__main__")
           module.__file__ = str(script)
-          module.__dict__["__install_workflow_hooks"] = install_workflow_hooks
+          module.__dict__["_workflow_prepare_client"] = install_workflow_hooks
           sys.modules["__main__"] = module
           sys.path.insert(0, str(script.parent))
           # Keep sys.argv pointing to this launcher, so the bot's existing os.execv()
