@@ -73,20 +73,20 @@ jobs:
           import os
           import re
           if not os.environ.get("DISCORD_TOKEN", "").strip():
-              raise SystemExit("Add the DISCORD_TOKEN repository secret.")
+              raise SystemExit("Add the DISCORD_TOKEN repository secret")
           owner_id = os.environ.get("OWNER_ID", "").strip()
           if not owner_id.isdigit() or int(owner_id) <= 0:
-              raise SystemExit("Set OWNER_ID to your numeric Discord user ID (a secret or variable).")
+              raise SystemExit("Set OWNER_ID to your numeric Discord user ID (a secret or variable)")
           owner = os.environ["ARCHIVE_OWNER"].strip()
           repo = os.environ.get("ARCHIVE_REPO", "").strip()
           if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repo):
-              raise SystemExit("Set ARCHIVE_OWNER and ARCHIVE_REPO to the other account's owner/repository names, not URLs.")
+              raise SystemExit("Set ARCHIVE_OWNER and ARCHIVE_REPO to the other account's owner/repository names, not URLs")
           if not os.environ.get("GH_PAT", "").strip():
-              raise SystemExit("Add GH_PAT with Actions read/write access to the archive repository.")
+              raise SystemExit("Add GH_PAT with Actions read/write access to the archive repository")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
               output.write(f"ARCHIVE_TARGET_OWNER={owner}\n")
               output.write(f"ARCHIVE_TARGET_REPO={repo}\n")
-          print("Bot configuration is present.")
+          print("Bot configuration is present")
           PY
 
       - name: Restore application files and data
@@ -124,7 +124,7 @@ jobs:
           app = workspace / "app"
           entry = PurePosixPath(os.environ["PYTHON_FILE"].replace("\\", "/"))
           if entry.is_absolute() or ".." in entry.parts or entry.suffix != ".py":
-              raise SystemExit("python_file must be a relative .py path inside the project.")
+              raise SystemExit("python_file must be a relative .py path inside the project")
           if os.environ["FORCE_REIMPORT"] == "true" and app.exists():
               shutil.rmtree(app)
           app.mkdir(parents=True, exist_ok=True)
@@ -133,11 +133,11 @@ jobs:
           if zip_url and not (app / entry).is_file():
               folder = PurePosixPath(os.environ.get("APP_ZIP_FOLDER", "").replace("\\", "/"))
               if folder.is_absolute() or ".." in folder.parts:
-                  raise SystemExit("APP_ZIP_FOLDER must be a relative folder inside the ZIP.")
+                  raise SystemExit("APP_ZIP_FOLDER must be a relative folder inside the ZIP")
               with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temp:
                   temp = Path(temp)
                   archive = temp / "project.zip"
-                  print("Downloading Python project ZIP...", flush=True)
+                  print("Downloading Python project ZIP", flush=True)
                   subprocess.run([
                       "curl", "--fail", "--location", "--silent", "--show-error",
                       "--retry", "5", "--retry-delay", "5", "--connect-timeout", "30",
@@ -149,10 +149,10 @@ jobs:
                       for member in zf.infolist():
                           path = PurePosixPath(member.filename.replace("\\", "/"))
                           if path.is_absolute() or ".." in path.parts:
-                              raise SystemExit("ZIP contains an unsafe path.")
+                              raise SystemExit("ZIP contains an unsafe path")
                           mode = member.external_attr >> 16
                           if stat.S_ISLNK(mode):
-                              raise SystemExit("ZIP symlinks are not supported.")
+                              raise SystemExit("ZIP symlinks are not supported")
                           target = extracted.joinpath(*path.parts)
                           if member.is_dir():
                               target.mkdir(parents=True, exist_ok=True)
@@ -164,16 +164,16 @@ jobs:
                                   target.chmod(0o755)
                   source = extracted.joinpath(*folder.parts)
                   if not source.is_dir() or not (source / entry).is_file():
-                      raise SystemExit("Python file not found in ZIP. Check python_file and APP_ZIP_FOLDER.")
+                      raise SystemExit("Python file not found in ZIP, check python_file and APP_ZIP_FOLDER")
                   shutil.rmtree(app)
                   shutil.copytree(source, app)
           elif not (app / entry).is_file():
-              raise SystemExit("No cached bot found. Add APP_ZIP_URL with the direct download URL of your bot ZIP.")
+              raise SystemExit("No cached bot found, add APP_ZIP_URL with the direct download URL of your bot ZIP")
 
           script = (app / entry).resolve()
           if not script.is_relative_to(app.resolve()) or not script.is_file():
-              raise SystemExit("Python file not found in the imported bot ZIP. Check python_file and APP_ZIP_FOLDER.")
-          print("Bot files and data are ready.")
+              raise SystemExit("Python file not found in the imported bot ZIP, check python_file and APP_ZIP_FOLDER")
+          print("Bot files and data are ready")
           PY
 
       - name: Install the bot's Python dependencies
@@ -197,7 +197,7 @@ jobs:
           set -Eeuo pipefail
           for config_name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET_NAME; do
             if [ -z "${!config_name}" ]; then
-              echo "::error::Set $config_name before starting the bot; every successful session now requires an R2 backup."
+              echo "::error::Set $config_name before starting the bot, every successful session now requires an R2 backup"
               exit 1
             fi
           done
@@ -222,8 +222,8 @@ jobs:
           def install_workflow_hooks(client):
               if getattr(client, "_workflow_hooks_installed", False):
                   return client
-              # The uploaded bot saves state in /restart, but not in close(). Install
-              # the same save operation for timed shutdowns without editing its source.
+              # The uploaded bot saves state in /restart, but not in close(), install
+              # the same save operation for timed shutdowns without editing its source
               save_original = client.save_state
               load_original = client.load_state
               close_original = client.close
@@ -258,8 +258,8 @@ jobs:
                               queued_before = len(client.queued_jobs[user_id])
                               await namespace["check_and_process_queue"](user_id)
                               if len(client.queued_jobs[user_id]) >= queued_before:
-                                  # Newer bots pause queues while every cookie is disabled.
-                                  # Yield to their cookie poller instead of spinning here.
+                                  # Newer bots pause queues while every cookie is disabled
+                                  # Yield to their cookie poller instead of spinning here
                                   break
 
               async def run_delayed_retry(retry_id):
@@ -272,8 +272,8 @@ jobs:
                       record = delayed_retries.get(retry_id)
                       if record is None:
                           return
-                      # UTC timestamps retain elapsed offline time. Never restart a
-                      # two-hour wait merely because the bot or workflow restarted.
+                      # UTC timestamps retain elapsed offline time, never restart a
+                      # two-hour wait merely because the bot or workflow restarted
                       while record["due_at"] > time.time():
                           await asyncio.sleep(min(record["due_at"] - time.time(), 60))
                       if closing:
@@ -303,22 +303,22 @@ jobs:
                               queued_job += (True,)
                           client.queued_jobs[user_id].append(queued_job)
                           # Queue insertion and timer removal are one snapshot change,
-                          # so a restart cannot restore this as both queued and waiting.
+                          # so a restart cannot restore this as both queued and waiting
                           delayed_retries.pop(retry_id)
                           retry_messages.pop(retry_id, None)
                           if client.active_jobs[user_id] < namespace["MAX_CONCURRENT_JOBS"]:
                               await namespace["check_and_process_queue"](user_id)
                   except asyncio.CancelledError:
-                      # Shutdown cancels the sleep; its saved record remains intact.
+                      # Shutdown cancels the sleep, its saved record remains intact
                       raise
                   except Exception:
-                      logging.exception("Delayed retry could not resume; any waiting record is retained.")
+                      logging.exception("Delayed retry could not resume, any waiting record is retained")
                   finally:
                       retry_tasks.discard(task)
 
               def schedule_timeout_retry(context):
-                  # Register synchronously, before create_task() starts the coroutine.
-                  # This also covers a shutdown immediately after the timer is scheduled.
+                  # Register synchronously, before create_task() starts the coroutine
+                  # This also covers a shutdown immediately after the timer is scheduled
                   retry_id = uuid.uuid4().hex
                   message = context.get("status_msg")
                   delayed_retries[retry_id] = {
@@ -346,31 +346,31 @@ jobs:
               async def load_state():
                   nonlocal initialized
                   restored_retries = {}
-                  # Refuse to silently replace a malformed state file with empty state.
+                  # Refuse to silently replace a malformed state file with empty state
                   if state.exists():
                       snapshot = json.loads(state.read_text(encoding="utf-8"))
                       if not isinstance(snapshot, dict) or any(
                           key in snapshot and not isinstance(snapshot[key], dict) for key in required
                       ):
-                          raise RuntimeError("bot_state.json does not contain the expected bot state.")
+                          raise RuntimeError("bot_state.json does not contain the expected bot state")
                       records = snapshot.get("workflow_delayed_retries", [])
                       if not isinstance(records, list):
-                          raise RuntimeError("Invalid saved delayed retries; keeping the previous state.")
+                          raise RuntimeError("Invalid saved delayed retries, keeping the previous state")
                       for record in records:
                           if not isinstance(record, dict):
-                              raise RuntimeError("Invalid delayed retry record.")
+                              raise RuntimeError("Invalid delayed retry record")
                           retry_id, due_at, job = record.get("id"), record.get("due_at"), record.get("job")
                           if (not isinstance(retry_id, str) or not retry_id or retry_id in restored_retries
                               or not isinstance(due_at, (int, float)) or not math.isfinite(due_at)
                               or not isinstance(job, dict)
                               or not {"user_id", "target_url", "url_type", "is_silent"}.issubset(job)
                               or not isinstance(job["user_id"], int)):
-                              raise RuntimeError("Invalid delayed retry deadline or job data.")
+                              raise RuntimeError("Invalid delayed retry deadline or job data")
                           restored_retries[retry_id] = record
                   await load_original()
                   if state.exists():
-                      # This bot removes the state file only after a successful load.
-                      raise RuntimeError("The bot could not restore bot_state.json; keeping the prior cache.")
+                      # This bot removes the state file only after a successful load
+                      raise RuntimeError("The bot could not restore bot_state.json, keeping the prior cache")
                   initialized = True
                   delayed_retries.update(restored_retries)
                   for retry_id in restored_retries:
@@ -378,7 +378,7 @@ jobs:
                   if getattr(client, "queued_jobs", None):
                       track_task(asyncio.create_task(resume_queues()))
                   if restored_retries:
-                      logging.info("Restored %s delayed retries with their original deadlines.", len(restored_retries))
+                      logging.info("Restored %s delayed retries with their original deadlines", len(restored_retries))
 
               async def save_state():
                   async with save_lock:
@@ -389,12 +389,12 @@ jobs:
                       try:
                           namespace["STATE_FILE"] = str(temporary)
                           await save_original()
-                          # The original method logs write errors instead of raising.
-                          # Verify a fresh snapshot before replacing the previous one.
+                          # The original method logs write errors instead of raising
+                          # Verify a fresh snapshot before replacing the previous one
                           raw = temporary.read_bytes()
                           snapshot = json.loads(raw)
                           if not isinstance(snapshot, dict) or not required.issubset(snapshot):
-                              raise RuntimeError("The bot did not save a complete state snapshot.")
+                              raise RuntimeError("The bot did not save a complete state snapshot")
                           snapshot["workflow_delayed_retries"] = retry_snapshot
                           raw = json.dumps(snapshot, indent=4).encode("utf-8")
                           temporary.write_bytes(raw)
@@ -428,7 +428,7 @@ jobs:
                           if waiting_tasks:
                               await asyncio.gather(*waiting_tasks, return_exceptions=True)
                           await save_state()
-                          logging.info("Bot state saved for the next workflow session.")
+                          logging.info("Bot state saved for the next workflow session")
                   finally:
                       await close_original()
 
@@ -440,11 +440,11 @@ jobs:
                   close_done = asyncio.get_running_loop().create_future()
                   try:
                       # Stay in the caller's task: the existing /restart must reach
-                      # os.execv before discord.py finishes shutting down its loop.
+                      # os.execv before discord.py finishes shutting down its loop
                       await flush_and_close()
                   except BaseException as error:
                       close_done.set_exception(error)
-                      close_done.exception()  # Mark retrieved even without a second caller.
+                      close_done.exception()  # Mark retrieved even without a second caller
                       raise
                   else:
                       close_done.set_result(None)
@@ -460,14 +460,14 @@ jobs:
           script = Path(sys.argv[1]).resolve()
           tree = ast.parse(script.read_text(encoding="utf-8-sig"), filename=str(script))
           # Find the actual startup call, including a __main__ guard or main()
-          # function. Install hooks on its receiver immediately before it runs.
+          # function, install hooks on its receiver immediately before it runs
           startup_calls = [node for node in ast.walk(tree) if (
               isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
               and node.func.attr == "run" and isinstance(node.func.value, ast.Name)
               and node.func.value.id == "client"
           )]
           if not startup_calls:
-              raise SystemExit(f"No client.run(...) startup call was found in {script.name}; check the python_file input and ZIP contents.")
+              raise SystemExit(f"No client.run(...) startup call was found in {script.name}, check the python_file input and ZIP contents")
           for call in startup_calls:
               call.func.value = ast.Call(
                   func=ast.Name(id="_workflow_prepare_client", ctx=ast.Load()),
@@ -480,7 +480,7 @@ jobs:
           sys.modules["__main__"] = module
           sys.path.insert(0, str(script.parent))
           # Keep sys.argv pointing to this launcher, so the bot's existing os.execv()
-          # restart reloads these shutdown hooks as well as the original bot.
+          # restart reloads these shutdown hooks as well as the original bot
           exec(compile(tree, str(script), "exec"), module.__dict__)
           PY
 
@@ -495,6 +495,7 @@ jobs:
           WORKFLOW_STATE_RECEIPT: ${{ runner.temp }}/yt-bot-state-receipt
           WORKFLOW_RESTART_FILE: ${{ runner.temp }}/python-restart-request
           WORKFLOW_UPLOAD_FILE: ${{ runner.temp }}/python-upload-request
+          WORKFLOW_SHUTDOWN_FILE: ${{ runner.temp }}/python-shutdown-request
         run: |
           set -Eeuo pipefail
           "$RUNNER_TEMP/yt-bot-venv/bin/python" - <<'PY'
@@ -511,7 +512,8 @@ jobs:
           script = (app / os.environ["PYTHON_FILE"].replace("\\", "/")).resolve()
           restart_file = Path(os.environ["WORKFLOW_RESTART_FILE"])
           upload_file = Path(os.environ["WORKFLOW_UPLOAD_FILE"])
-          for marker in (restart_file, upload_file):
+          shutdown_file = Path(os.environ["WORKFLOW_SHUTDOWN_FILE"])
+          for marker in (restart_file, upload_file, shutdown_file):
               marker.unlink(missing_ok=True)
 
           cancelled = False
@@ -529,6 +531,7 @@ jobs:
           reason = "script-exited"
           forced = False
           upload_requested = False
+          shutdown_requested = False
 
           def send_group(sig):
               try:
@@ -536,11 +539,15 @@ jobs:
               except ProcessLookupError:
                   pass
 
-          print("YouTube Archive Bot session started; maximum duration is 5:30:00.", flush=True)
+          print("YouTube Archive Bot session started, maximum duration is 5:30:00", flush=True)
           try:
               while True:
                   if cancelled:
                       reason = "cancelled"
+                      break
+                  if shutdown_file.exists():
+                      shutdown_requested = True
+                      reason = "shutdown-request"
                       break
                   if upload_file.exists():
                       upload_requested = True
@@ -557,24 +564,29 @@ jobs:
                   time.sleep(1)
 
               if child.poll() is None:
-                  print("Sending Ctrl+C; waiting up to 120 seconds for shutdown...", flush=True)
+                  print("Sending Ctrl+C, waiting up to 120 seconds for shutdown", flush=True)
                   send_group(signal.SIGINT)
                   try:
                       child.wait(timeout=120)
                   except subprocess.TimeoutExpired:
                       forced = True
-                      print("::error::Python did not stop within 120 seconds.", flush=True)
+                      print("::error::Python did not stop within 120 seconds", flush=True)
                       send_group(signal.SIGKILL)
                       child.wait(timeout=10)
               code = child.returncode
           finally:
-              # Clean up any remaining subprocesses belonging to this application.
+              # Clean up any remaining subprocesses belonging to this application
               send_group(signal.SIGKILL)
               child.wait(timeout=10)
-              for marker in (restart_file, upload_file):
+              # Honor a shutdown request received while the child was closing
+              if shutdown_file.exists():
+                  shutdown_requested = True
+                  if not cancelled:
+                      reason = "shutdown-request"
+              for marker in (restart_file, upload_file, shutdown_file):
                   marker.unlink(missing_ok=True)
 
-          planned_stop = reason in {"time-limit", "restart-request", "upload-request"}
+          planned_stop = reason in {"time-limit", "restart-request", "upload-request", "shutdown-request"}
           expected_exit = code == 0 or (planned_stop and code in {-signal.SIGINT, 130})
           ok = expected_exit and not forced and not cancelled
           if ok:
@@ -583,7 +595,7 @@ jobs:
                   receipt = Path(os.environ["WORKFLOW_STATE_RECEIPT"])
                   digest = hashlib.sha256(state.read_bytes()).hexdigest()
                   if receipt.read_text(encoding="ascii") != digest:
-                      raise RuntimeError("Bot state was not saved by this session.")
+                      raise RuntimeError("Bot state was not saved by this session")
                   for filename in ("archive_data.db", "excluded_urls.db"):
                       path = app / filename
                       if not path.is_file():
@@ -598,13 +610,16 @@ jobs:
                   print(f"::error::State validation failed: {error}", flush=True)
                   ok = False
           cache_safe = ok
-          print(f"Session ended: {reason}; script exit code: {code}", flush=True)
+          print(f"Session ended: {reason}, script exit code: {code}", flush=True)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"cache_safe={str(cache_safe).lower()}\n")
               output.write(f"ok={str(ok).lower()}\n")
               output.write(f"upload_requested={str(upload_requested).lower()}\n")
+              output.write(f"shutdown_requested={str(shutdown_requested).lower()}\n")
+          if shutdown_requested:
+              print("Owner requested shutdown, automatic continuation is disabled", flush=True)
           if not ok:
-              print("::error::Session failed or was interrupted; no new session will start.")
+              print("::error::Session failed or was interrupted, no new session will start")
               sys.exit(1)
           PY
 
@@ -668,13 +683,13 @@ jobs:
               config=Config(request_checksum_calculation="when_required", response_checksum_validation="when_required")
           )
           bucket = os.environ["R2_BUCKET_NAME"]
-          # Keep each repository, workflow file and branch in its own backup folder.
+          # Keep each repository, workflow file and branch in its own backup folder
           scope = hashlib.sha256(os.environ["GITHUB_WORKFLOW_REF"].encode("utf-8")).hexdigest()[:16]
           prefix = f"yt-bot-backups/{os.environ['GITHUB_REPOSITORY']}/{scope}/"
           key = prefix + archive_name
           managed_name = re.compile(re.escape(prefix) + r"yt-bot_\d{4}(?:_\d{2}){5}_\d+_\d+\.zip")
 
-          # Snapshot existing managed ZIPs before uploading. Never delete unrelated keys.
+          # Snapshot existing managed ZIPs before uploading, never delete unrelated keys
           previous_keys = []
           for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
               for entry in page.get("Contents", []):
@@ -691,25 +706,25 @@ jobs:
               Config=TransferConfig(preferred_transfer_client="classic")
           )
 
-          # Read the uploaded bytes back and verify them before removing any older ZIP.
+          # Read the uploaded bytes back and verify them before removing any older ZIP
           response = client.get_object(Bucket=bucket, Key=key)
           remote_sha256 = hashlib.sha256()
           received = 0
           with closing(response["Body"]) as body:
               if response["ContentLength"] != local_size:
-                  raise SystemExit("R2 backup size verification failed; previous backups were kept.")
+                  raise SystemExit("R2 backup size verification failed, previous backups were kept")
               for chunk in iter(lambda: body.read(1024 * 1024), b""):
                   remote_sha256.update(chunk)
                   received += len(chunk)
           if received != local_size or remote_sha256.hexdigest() != local_sha256:
-              raise SystemExit("R2 backup SHA-256 verification failed; previous backups were kept.")
+              raise SystemExit("R2 backup SHA-256 verification failed, previous backups were kept")
           print(f"Backup uploaded and verified: {key}")
 
           for previous_key in previous_keys:
               client.delete_object(Bucket=bucket, Key=previous_key)
               print(f"Deleted previous backup: {previous_key}")
           archive.unlink()
-          print(f"R2 backup complete; removed {len(previous_keys)} previous backup(s).")
+          print(f"R2 backup complete, removed {len(previous_keys)} previous backup(s)")
           PY
 
       - name: Confirm saved cache and prune old entries
@@ -728,11 +743,11 @@ jobs:
           if ! jq -se --arg key "$CURRENT_KEY" \
             '[.[].actions_caches[]] | any(.key == $key)' \
             "$RUNNER_TEMP/yt-bot-caches.json" > /dev/null; then
-            echo "::error::New app cache was not found. Keeping all existing caches and stopping continuation."
+            echo "::error::New app cache was not found, keeping all existing caches and stopping continuation"
             exit 1
           fi
 
-          # Keep the newly saved cache plus one previous version, only on this ref.
+          # Keep the newly saved cache plus one previous version, only on this ref
           jq -sr --arg key "$CURRENT_KEY" --arg prefix "$CACHE_PREFIX" \
             '[.[].actions_caches[] | select((.key | startswith($prefix)) and .key != $key)]
              | sort_by(.created_at) | reverse | .[1:][] | .id' \
@@ -743,7 +758,7 @@ jobs:
           done < "$RUNNER_TEMP/yt-bot-old-cache-ids"
 
       - name: Start next bot session
-        if: ${{ success() && steps.run.outputs.ok == 'true' && inputs.continue }}
+        if: ${{ success() && steps.run.outputs.ok == 'true' && steps.run.outputs.shutdown_requested != 'true' && inputs.continue }}
         env:
           GH_TOKEN: ${{ github.token }}
           NEXT_PYTHON_VERSION: ${{ inputs.python_version }}
@@ -760,4 +775,4 @@ jobs:
           gh api --method POST \
             "/repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/dispatches" \
             --input "$RUNNER_TEMP/yt-bot-next-session.json"
-          echo "Next bot session queued."
+          echo "Next bot session queued"
