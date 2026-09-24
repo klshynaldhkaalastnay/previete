@@ -24,11 +24,6 @@ on:
         required: true
         default: "3.x"
         type: string
-      upload_backup:
-        description: "Upload an R2 backup after every successful session"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -192,8 +187,7 @@ jobs:
             "aiofiles>=23,<26" "python-dotenv>=1,<2" "internetarchive>=5,<6"
           "$BOT_PYTHON" -m pip check
 
-      - name: Check requested R2 backup configuration
-        if: inputs.upload_backup
+      - name: Check R2 backup configuration
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -203,7 +197,7 @@ jobs:
           set -Eeuo pipefail
           for config_name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET_NAME; do
             if [ -z "${!config_name}" ]; then
-              echo "::error::Set $config_name before enabling upload_backup."
+              echo "::error::Set $config_name before starting the bot; every successful session now requires an R2 backup."
               exit 1
             fi
           done
@@ -605,8 +599,8 @@ jobs:
             !app/**/__pycache__
           key: yt-bot-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Back up bot files and data to Cloudflare R2
-        if: ${{ !cancelled() && steps.run.outputs.ok == 'true' && (inputs.upload_backup || steps.run.outputs.upload_requested == 'true') }}
+      - name: Back up to R2 and remove previous backups
+        if: ${{ !cancelled() && steps.run.outputs.ok == 'true' }}
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -618,16 +612,19 @@ jobs:
           BACKUP_PYTHON="$RUNNER_TEMP/python-backup-venv/bin/python"
           "$BACKUP_PYTHON" -m pip install boto3
           "$BACKUP_PYTHON" - <<'PY'
+          from contextlib import closing
           from datetime import datetime, timezone
+          import hashlib
           import os
           from pathlib import Path
+          import re
           import zipfile
           import boto3
           from boto3.s3.transfer import TransferConfig
           from botocore.config import Config
 
           required = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ACCOUNT_ID", "R2_BUCKET_NAME")
-          missing = [name for name in required if not os.environ.get(name)]
+          missing = [name for name in required if not os.environ.get(name, "").strip()]
           if missing:
               raise SystemExit("Missing R2 configuration: " + ", ".join(missing))
           stamp = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
@@ -648,12 +645,49 @@ jobs:
               aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"], region_name="auto",
               config=Config(request_checksum_calculation="when_required", response_checksum_validation="when_required")
           )
+          bucket = os.environ["R2_BUCKET_NAME"]
+          # Keep each repository, workflow file and branch in its own backup folder.
+          scope = hashlib.sha256(os.environ["GITHUB_WORKFLOW_REF"].encode("utf-8")).hexdigest()[:16]
+          prefix = f"yt-bot-backups/{os.environ['GITHUB_REPOSITORY']}/{scope}/"
+          key = prefix + archive_name
+          managed_name = re.compile(re.escape(prefix) + r"yt-bot_\d{4}(?:_\d{2}){5}_\d+_\d+\.zip")
+
+          # Snapshot existing managed ZIPs before uploading. Never delete unrelated keys.
+          previous_keys = []
+          for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+              for entry in page.get("Contents", []):
+                  previous_key = entry["Key"]
+                  if previous_key != key and managed_name.fullmatch(previous_key):
+                      previous_keys.append(previous_key)
+
+          with archive.open("rb") as source:
+              local_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+          local_size = archive.stat().st_size
           client.upload_file(
-              str(archive), os.environ["R2_BUCKET_NAME"], archive_name,
+              str(archive), bucket, key,
+              ExtraArgs={"ContentType": "application/zip", "Metadata": {"sha256": local_sha256}},
               Config=TransferConfig(preferred_transfer_client="classic")
           )
+
+          # Read the uploaded bytes back and verify them before removing any older ZIP.
+          response = client.get_object(Bucket=bucket, Key=key)
+          remote_sha256 = hashlib.sha256()
+          received = 0
+          with closing(response["Body"]) as body:
+              if response["ContentLength"] != local_size:
+                  raise SystemExit("R2 backup size verification failed; previous backups were kept.")
+              for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                  remote_sha256.update(chunk)
+                  received += len(chunk)
+          if received != local_size or remote_sha256.hexdigest() != local_sha256:
+              raise SystemExit("R2 backup SHA-256 verification failed; previous backups were kept.")
+          print(f"Backup uploaded and verified: {key}")
+
+          for previous_key in previous_keys:
+              client.delete_object(Bucket=bucket, Key=previous_key)
+              print(f"Deleted previous backup: {previous_key}")
           archive.unlink()
-          print(f"Backup uploaded: {archive_name}")
+          print(f"R2 backup complete; removed {len(previous_keys)} previous backup(s).")
           PY
 
       - name: Confirm saved cache and prune old entries
@@ -691,7 +725,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           NEXT_PYTHON_VERSION: ${{ inputs.python_version }}
-          NEXT_UPLOAD_BACKUP: ${{ inputs.upload_backup }}
         run: |
           set -Eeuo pipefail
           WORKFLOW_ID="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id')"
@@ -699,9 +732,8 @@ jobs:
             --arg ref "$GITHUB_REF_NAME" \
             --arg filename "$PYTHON_FILE" \
             --arg version "$NEXT_PYTHON_VERSION" \
-            --arg backup "$NEXT_UPLOAD_BACKUP" \
             '{ref: $ref, inputs: {continue: "true", force_reimport: "false",
-              python_file: $filename, python_version: $version, upload_backup: $backup}}' \
+              python_file: $filename, python_version: $version}}' \
             > "$RUNNER_TEMP/yt-bot-next-session.json"
           gh api --method POST \
             "/repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/dispatches" \
