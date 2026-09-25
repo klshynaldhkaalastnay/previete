@@ -1,3 +1,8 @@
+# Repository requirements: only this file at .github/workflows/tiktok.yml
+# APP_ZIP_URL: secret containing a direct HTTPS download link to TikTok-Telegram-Bot.zip
+# The original bot ZIP already contains every helper this workflow needs
+# All other bot and R2 secrets keep their existing names
+# force_reimport refreshes application code only, queue state is preserved
 
 name: TikTok Telegram Bot
 
@@ -57,7 +62,7 @@ jobs:
 
       - name: Import application from ZIP or reuse cache
         env:
-          APP_ZIP_URL: ${{ secrets.TELE_ZIP }}
+          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
           FORCE_REIMPORT: ${{ inputs.force_reimport }}
         run: |
           python - <<'PY'
@@ -182,10 +187,40 @@ jobs:
         id: session
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          OWNER_ID: ${{ secrets.TELE_OWNER_ID || vars.TELE_OWNER_ID }}
+          OWNER_ID: ${{ secrets.OWNER_ID || vars.OWNER_ID }}
           QUEUE_BYPASS_USER_ID: ${{ secrets.QUEUE_BYPASS_USER_ID || vars.QUEUE_BYPASS_USER_ID }}
           TIKTOK_COOKIES_BASE64: ${{ secrets.TIKTOK_COOKIES_BASE64 }}
         run: |
+          # Missing optional secrets are empty strings in GitHub Actions
+          export QUEUE_BYPASS_USER_ID="${QUEUE_BYPASS_USER_ID:-0}"
+          python - <<'PYCONFIG'
+          import base64
+          import binascii
+          import os
+          import sys
+
+          def fail(message):
+              print('::error::'+message, file=sys.stderr)
+              sys.exit(1)
+
+          if not os.getenv('TELEGRAM_BOT_TOKEN', '').strip():
+              fail('Set TELEGRAM_BOT_TOKEN to the bot token from BotFather')
+          for name, optional in (('OWNER_ID', False), ('QUEUE_BYPASS_USER_ID', True)):
+              value = os.getenv(name, '').strip()
+              if not value or not value.isascii() or not value.isdecimal():
+                  fail(name+' must be a numeric Telegram user ID, not a username or Discord ID')
+              if int(value) <= 0 and not (optional and int(value) == 0):
+                  fail(name+' must be a positive Telegram user ID')
+          cookies = os.getenv('TIKTOK_COOKIES_BASE64', '').strip()
+          if cookies:
+              try:
+                  decoded = base64.b64decode(cookies, validate=True)
+              except (ValueError, binascii.Error):
+                  fail('TIKTOK_COOKIES_BASE64 must contain valid base64 encoded cookies')
+              if b'\t' not in decoded:
+                  fail('TIKTOK_COOKIES_BASE64 must contain a base64 encoded Netscape cookie file')
+          print('Bot configuration validated')
+          PYCONFIG
           python "$BOT_SOURCE_DIR/bot.py"
           python "$BOT_SOURCE_DIR/backup.py" receipt
 
