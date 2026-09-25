@@ -1,0 +1,250 @@
+
+name: TikTok Telegram Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      continue:
+        description: Start another session after a successful run
+        required: true
+        default: true
+        type: boolean
+      force_reimport:
+        description: Refresh the source ZIP while preserving saved jobs
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: tiktok-telegram-bot
+  cancel-in-progress: false
+
+env:
+  SESSION_SECONDS: '19800'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  BOT_DATA_DIR: ${{ github.workspace }}/state
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@main
+
+      - name: Set up Python
+        uses: actions/setup-python@main
+        with:
+          python-version: '3.12'
+
+      - name: Restore imported application
+        if: ${{ inputs.force_reimport != true }}
+        uses: actions/cache/restore@main
+        with:
+          path: app
+          key: tiktok-source-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tiktok-source-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Import application from ZIP or reuse cache
+        env:
+          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
+          FORCE_REIMPORT: ${{ inputs.force_reimport }}
+        run: |
+          python - <<'PY'
+          """Optional ZIP source import, state always lives outside the imported code"""
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import sys
+          import tempfile
+          import urllib.request
+          import zipfile
+
+
+          def extract_project(archive,destination):
+              with zipfile.ZipFile(archive) as z:
+                  files = z.infolist()
+                  if sum(f.file_size for f in files)>30_000_000 or len(files)>500:
+                      raise ValueError('Bot ZIP is too large')
+                  for item in files:
+                      p = PurePosixPath(item.filename)
+                      mode = item.external_attr>>16
+                      if p.is_absolute() or '..' in p.parts or '\\' in item.filename or mode & 0o170000 == 0o120000:
+                          raise ValueError('Unsafe ZIP entry')
+                  with tempfile.TemporaryDirectory() as td:
+                      z.extractall(td)
+                      candidates = [p.parent for p in Path(td).rglob('bot.py') if (p.parent/'requirements.txt').is_file()]
+                      if len(candidates)!=1:
+                          raise ValueError('ZIP must contain exactly one bot project')
+                      source = candidates[0]
+                      if destination.exists():
+                          shutil.rmtree(destination)
+                      destination.mkdir(parents=True)
+                      # Never import saved credentials or queue data from a code ZIP
+                      for file in source.iterdir():
+                          if file.is_file() and (file.suffix=='.py' or file.name in ('requirements.txt','README.md')):
+                              shutil.copy2(file,destination/file.name)
+                      workflow = source/'.github/workflows/tiktok.yml'
+                      if workflow.is_file():
+                          target = destination/'.github/workflows/tiktok.yml'
+                          target.parent.mkdir(parents=True)
+                          shutil.copy2(workflow,target)
+
+
+          def main():
+              root = Path.cwd()
+              app = root/'app'
+              url = os.getenv('APP_ZIP_URL','').strip()
+              refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
+              required = ('bot.py','worker.py','state.py','common.py','backup.py',
+                          'workflow_tools.py','requirements.txt')
+              cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
+                                   for name in required)
+              if refresh or not cache_complete:
+                  if not url:
+                      raise SystemExit('Set APP_ZIP_URL to the direct HTTPS download URL of your bot ZIP')
+                  if not url.startswith('https://'):
+                      raise SystemExit('APP_ZIP_URL must use HTTPS')
+                  with tempfile.TemporaryDirectory() as td:
+                      archive = Path(td)/'app.zip'
+                      with urllib.request.urlopen(url,timeout=60) as response,archive.open('wb') as out:
+                          if not response.geturl().startswith('https://'):
+                              raise ValueError('ZIP redirect must use HTTPS')
+                          count = 0
+                          while chunk := response.read(1024*1024):
+                              count += len(chunk)
+                              if count > 30_000_000:
+                                  raise ValueError('Bot ZIP is too large')
+                              out.write(chunk)
+                      extract_project(archive,app)
+              if any(not (app/name).is_file() or (app/name).is_symlink() for name in required):
+                  raise SystemExit('Bot ZIP is missing required application files or workflow_tools.py')
+              # Preserve the actual running workflow in future R2 backups
+              workflow_ref = os.getenv('GITHUB_WORKFLOW_REF','')
+              if workflow_ref:
+                  relative = workflow_ref.split('/',2)[2].rsplit('@',1)[0]
+                  workflow = root/relative
+                  if workflow.is_file():
+                      target = app/'.github/workflows/tiktok.yml'
+                      target.parent.mkdir(parents=True,exist_ok=True)
+                      shutil.copy2(workflow,target)
+              with open(os.environ['GITHUB_ENV'],'a') as out:
+                  out.write('BOT_SOURCE_DIR='+str(app)+'\n')
+              print('Bot source ready, application files are loaded from the ZIP or cache')
+
+
+          if __name__=='__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  print(f'Source import failed, {type(exc).__name__}',file=sys.stderr)
+                  sys.exit(1)
+          PY
+
+      - name: Cache pip downloads
+        uses: actions/cache@main
+        with:
+          path: ~/.cache/pip
+          key: tiktok-pip-${{ runner.os }}-py312-${{ hashFiles('app/requirements.txt') }}
+          restore-keys: |
+            tiktok-pip-${{ runner.os }}-py312-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r "$BOT_SOURCE_DIR/requirements.txt"
+          python -m pip check
+
+      - name: Check R2 configuration
+        run: python "$BOT_SOURCE_DIR/backup.py" check
+
+      - name: Restore queue cache
+        uses: actions/cache/restore@main
+        with:
+          path: state/state.db
+          key: tiktok-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tiktok-state-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Validate state or restore R2 backup
+        run: python "$BOT_SOURCE_DIR/backup.py" restore
+
+      - name: Run bot
+        id: session
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID || vars.OWNER_ID }}
+          QUEUE_BYPASS_USER_ID: ${{ secrets.QUEUE_BYPASS_USER_ID || vars.QUEUE_BYPASS_USER_ID }}
+          TIKTOK_COOKIES_BASE64: ${{ secrets.TIKTOK_COOKIES_BASE64 }}
+        run: |
+          python "$BOT_SOURCE_DIR/bot.py"
+          python "$BOT_SOURCE_DIR/backup.py" receipt
+
+      - name: Back up to R2 and verify before pruning
+        if: ${{ success() && steps.session.outputs.ok == 'true' }}
+        run: python "$BOT_SOURCE_DIR/backup.py" backup
+
+      - name: Save queue cache
+        if: ${{ success() && steps.session.outputs.ok == 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: state/state.db
+          key: tiktok-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save imported application
+        if: ${{ success() && steps.session.outputs.ok == 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: app
+          key: tiktok-source-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify saved cache and prune older bot caches
+        if: ${{ success() && steps.session.outputs.ok == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python "$BOT_SOURCE_DIR/workflow_tools.py" prune
+
+      - name: Start next session
+        if: ${{ success() && steps.session.outputs.ok == 'true' && steps.session.outputs.reason != 'shutdown' && (inputs.continue || steps.session.outputs.reason == 'restart' || steps.session.outputs.reason == 'upload') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTINUE_SESSIONS: ${{ inputs.continue }}
+        run: python "$BOT_SOURCE_DIR/workflow_tools.py" dispatch
+
+      - name: Write sanitized diagnostics
+        if: ${{ always() }}
+        env:
+          SESSION_OK: ${{ steps.session.outputs.ok }}
+          SESSION_REASON: ${{ steps.session.outputs.reason }}
+        run: |
+          python - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          lines = ['TikTok bot diagnostics',
+                   'Session completed: '+os.getenv('SESSION_OK',''),
+                   'Stop reason: '+os.getenv('SESSION_REASON','')]
+          for package in ('gallery-dl','python-telegram-bot','boto3','Pillow'):
+              try:
+                  lines.append(package+': '+importlib.metadata.version(package))
+              except importlib.metadata.PackageNotFoundError:
+                  lines.append(package+': not installed')
+          Path('diagnostics.txt').write_text('\n'.join(lines)+'\n')
+          PY
+
+      - name: Upload sanitized diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@main
+        with:
+          name: tiktok-bot-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics.txt
+          retention-days: 7
