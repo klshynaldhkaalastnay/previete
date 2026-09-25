@@ -57,7 +57,7 @@ jobs:
 
       - name: Import application from ZIP or reuse cache
         env:
-          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
+          APP_ZIP_URL: ${{ secrets.TELE_ZIP }}
           FORCE_REIMPORT: ${{ inputs.force_reimport }}
         run: |
           python - <<'PY'
