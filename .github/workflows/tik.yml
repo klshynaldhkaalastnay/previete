@@ -62,7 +62,7 @@ jobs:
 
       - name: Import application from ZIP or reuse cache
         env:
-          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
+          APP_ZIP_URL: ${{ secrets.TELE_ZIP }}
           FORCE_REIMPORT: ${{ inputs.force_reimport }}
         run: |
           python - <<'PY'
@@ -187,7 +187,7 @@ jobs:
         id: session
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          OWNER_ID: ${{ secrets.OWNER_ID || vars.OWNER_ID }}
+          OWNER_ID: ${{ secrets.TELE_OWNER_ID || vars.TELE_OWNER_ID }}
           QUEUE_BYPASS_USER_ID: ${{ secrets.QUEUE_BYPASS_USER_ID || vars.QUEUE_BYPASS_USER_ID }}
           TIKTOK_COOKIES_BASE64: ${{ secrets.TIKTOK_COOKIES_BASE64 }}
         run: |
