@@ -14,6 +14,11 @@ on:
         required: true
         default: false
         type: boolean
+      update_python_file:
+        description: "Download and replace only the Python file from PYTHON_FILE_URL"
+        required: true
+        default: false
+        type: boolean
       python_file:
         description: "Python file relative to the project root"
         required: true
@@ -177,6 +182,7 @@ jobs:
           PY
 
       - name: Update only the bot Python file
+        if: inputs.update_python_file == true
         env:
           PYTHON_FILE_URL: ${{ secrets.PYTHON_FILE_URL }}
         run: |
@@ -190,8 +196,7 @@ jobs:
 
           url = os.environ.get("PYTHON_FILE_URL", "").strip()
           if not url:
-              print("PYTHON_FILE_URL is unset, using the restored Python file")
-              raise SystemExit(0)
+              raise SystemExit("Set PYTHON_FILE_URL before enabling update_python_file")
           if urlsplit(url).scheme not in ("https", "http"):
               raise SystemExit("PYTHON_FILE_URL must be a direct HTTP or HTTPS download URL")
 
@@ -821,7 +826,7 @@ jobs:
             --arg ref "$GITHUB_REF_NAME" \
             --arg filename "$PYTHON_FILE" \
             --arg version "$NEXT_PYTHON_VERSION" \
-            '{ref: $ref, inputs: {continue: "true", force_reimport: "false",
+            '{ref: $ref, inputs: {continue: "true", force_reimport: "false", update_python_file: "false",
               python_file: $filename, python_version: $version}}' \
             > "$RUNNER_TEMP/yt-bot-next-session.json"
           gh api --method POST \
