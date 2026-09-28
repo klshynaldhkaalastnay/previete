@@ -28,6 +28,7 @@ env:
   RESTART_COMMAND: "!restart"
   UPLOAD_COMMAND: "!upload"
   TMUX_SESSION: "salsa"
+  WORLD_NAME: "salsa"
 
 jobs:
   server:
@@ -155,7 +156,67 @@ jobs:
             echo "Sanitizing server.properties IP and port bindings..."
             sed -i 's/^server-ip=.*/server-ip=/' server.properties
             sed -i 's/^server-port=.*/server-port=25565/' server.properties
+
+            echo "Forcing Minecraft world to: $WORLD_NAME"
+            if grep -q '^level-name=' server.properties; then
+              sed -i "s/^level-name=.*/level-name=${WORLD_NAME}/" server.properties
+            else
+              printf '\nlevel-name=%s\n' "$WORLD_NAME" >> server.properties
+            fi
           fi
+
+      - name: Fix and verify BlueMap world configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd server
+
+          echo "=== Minecraft world preflight ==="
+          grep '^level-name=' server.properties || true
+
+          if [ ! -d "$WORLD_NAME" ]; then
+            echo "ERROR: Expected world directory '$PWD/$WORLD_NAME' does not exist."
+            echo "Available directories in the server root:"
+            find . -maxdepth 1 -mindepth 1 -type d -printf ' - %f\n' | sort
+            exit 1
+          fi
+
+          echo "World directory exists: $PWD/$WORLD_NAME"
+
+          BLUEMAP_MAPS="config/bluemap/maps"
+
+          if [ -d "$BLUEMAP_MAPS" ]; then
+            echo "=== Updating BlueMap map configs ==="
+
+            shopt -s nullglob
+            MAP_CONFIGS=("$BLUEMAP_MAPS"/*.conf)
+
+            if [ "${#MAP_CONFIGS[@]}" -eq 0 ]; then
+              echo "No BlueMap map .conf files exist yet; BlueMap can generate them on startup."
+            else
+              for MAP_CONFIG in "${MAP_CONFIGS[@]}"; do
+                echo "Updating $MAP_CONFIG"
+
+                if grep -Eq '^[[:space:]]*world[[:space:]]*:' "$MAP_CONFIG"; then
+                  sed -E -i "s|^([[:space:]]*world[[:space:]]*:[[:space:]]*).*$|\1\"${WORLD_NAME}\"|" "$MAP_CONFIG"
+                else
+                  printf '\nworld: "%s"\n' "$WORLD_NAME" >> "$MAP_CONFIG"
+                fi
+              done
+            fi
+
+            echo "=== BlueMap world values after update ==="
+            for MAP_CONFIG in "$BLUEMAP_MAPS"/*.conf; do
+              [ -e "$MAP_CONFIG" ] || continue
+              printf '%s: ' "$MAP_CONFIG"
+              grep -E '^[[:space:]]*world[[:space:]]*:' "$MAP_CONFIG" || echo "(no world setting)"
+            done
+          else
+            echo "BlueMap maps directory does not exist yet; BlueMap will create it when it starts."
+          fi
+
+          echo "=== Remaining references to the previous world name outside logs ==="
+          grep -RIn             --exclude='*.log'             --exclude-dir='logs'             --exclude-dir='bluemap/logs'             'mc_1_21_11_3961499'             config/bluemap server.properties 2>/dev/null || true
 
       - name: Configure Simple Voice Chat
         shell: bash
