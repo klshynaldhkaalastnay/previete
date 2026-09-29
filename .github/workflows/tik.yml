@@ -112,7 +112,7 @@ jobs:
               url = os.getenv('APP_ZIP_URL','').strip()
               refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
               required = ('bot.py','worker.py','state.py','common.py','backup.py',
-                          'workflow_tools.py','requirements.txt')
+                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py')
               cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
                                    for name in required)
               if refresh or not cache_complete:
@@ -168,6 +168,15 @@ jobs:
         run: |
           python -m pip install -r "$BOT_SOURCE_DIR/requirements.txt"
           python -m pip check
+
+      - name: Cache Chromium
+        uses: actions/cache@main
+        with:
+          path: ~/.cache/ms-playwright
+          key: tiktok-chromium-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Install Chromium for sound links
+        run: python -m playwright install --with-deps --no-shell chromium
 
       - name: Check R2 configuration
         run: python "$BOT_SOURCE_DIR/backup.py" check
