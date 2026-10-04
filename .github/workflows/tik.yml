@@ -1,4 +1,4 @@
-# Repository requirements: only this file at .github/workflows/tiktok.yml
+# Repository requirements: only this file at .github/workflows/tik.yml
 # APP_ZIP_URL: secret containing a direct HTTPS download link to TikTok-Telegram-Bot.zip
 # The original bot ZIP already contains every helper this workflow needs
 # All other bot and R2 secrets keep their existing names
@@ -99,9 +99,9 @@ jobs:
                       for file in source.iterdir():
                           if file.is_file() and (file.suffix=='.py' or file.name in ('requirements.txt','README.md')):
                               shutil.copy2(file,destination/file.name)
-                      workflow = source/'.github/workflows/tiktok.yml'
+                      workflow = source/'.github/workflows/tik.yml'
                       if workflow.is_file():
-                          target = destination/'.github/workflows/tiktok.yml'
+                          target = destination/'.github/workflows/tik.yml'
                           target.parent.mkdir(parents=True)
                           shutil.copy2(workflow,target)
 
@@ -112,7 +112,7 @@ jobs:
               url = os.getenv('APP_ZIP_URL','').strip()
               refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
               required = ('bot.py','worker.py','state.py','common.py','backup.py',
-                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py')
+                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','compression.py','broadcasts.py')
               cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
                                    for name in required)
               if refresh or not cache_complete:
@@ -140,7 +140,7 @@ jobs:
                   relative = workflow_ref.split('/',2)[2].rsplit('@',1)[0]
                   workflow = root/relative
                   if workflow.is_file():
-                      target = app/'.github/workflows/tiktok.yml'
+                      target = app/'.github/workflows/tik.yml'
                       target.parent.mkdir(parents=True,exist_ok=True)
                       shutil.copy2(workflow,target)
               with open(os.environ['GITHUB_ENV'],'a') as out:
@@ -169,7 +169,48 @@ jobs:
           python -m pip install -r "$BOT_SOURCE_DIR/requirements.txt"
           python -m pip check
 
+      - name: Restore FFmpeg cache
+        id: ffmpeg_cache
+        uses: actions/cache/restore@main
+        with:
+          path: ~/.ffmpeg
+          key: tiktok-ffmpeg-${{ runner.os }}-${{ runner.arch }}-yt-dlp-linux64-gpl-v1
+
+      - name: Install and check FFmpeg
+        run: |
+          set -euo pipefail
+          FF_DIR="$HOME/.ffmpeg"
+          mkdir -p "$FF_DIR"
+          if [ -x "$FF_DIR/bin/ffmpeg" ] && [ -x "$FF_DIR/bin/ffprobe" ]; then
+            echo "FFmpeg and ffprobe are already cached, not downloading"
+          else
+            ARCHIVE_URL="https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+            TMPFILE="$(mktemp "${RUNNER_TEMP:-/tmp}/tiktok-ffmpeg.XXXXXX.tar.xz")"
+            trap 'rm -f "$TMPFILE"' EXIT
+            echo "Downloading the FFmpeg static build"
+            curl --location --fail --retry 3 --connect-timeout 30 --max-time 300 --output "$TMPFILE" "$ARCHIVE_URL"
+            tar -xJf "$TMPFILE" -C "$FF_DIR" --strip-components=1
+          fi
+          test -x "$FF_DIR/bin/ffmpeg"
+          test -x "$FF_DIR/bin/ffprobe"
+          echo "$FF_DIR/bin" >> "$GITHUB_PATH"
+          export PATH="$FF_DIR/bin:$PATH"
+          ffmpeg -version
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264' >/dev/null
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep ' AAC ' >/dev/null
+          ffmpeg -hide_banner -filters 2>/dev/null | grep ' zscale ' >/dev/null
+          ffmpeg -hide_banner -filters 2>/dev/null | grep ' tonemap ' >/dev/null
+          ffprobe -version
+
+      - name: Save FFmpeg cache
+        if: ${{ steps.ffmpeg_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: ~/.ffmpeg
+          key: ${{ steps.ffmpeg_cache.outputs.cache-primary-key }}
+
       - name: Cache Chromium
+        # Browser binaries remain separate from video encoding and user data.
         uses: actions/cache@main
         with:
           path: ~/.cache/ms-playwright
@@ -277,7 +318,7 @@ jobs:
           lines = ['TikTok bot diagnostics',
                    'Session completed: '+os.getenv('SESSION_OK',''),
                    'Stop reason: '+os.getenv('SESSION_REASON','')]
-          for package in ('gallery-dl','python-telegram-bot','boto3','Pillow'):
+          for package in ('gallery-dl','aiogram','boto3','Pillow'):
               try:
                   lines.append(package+': '+importlib.metadata.version(package))
               except importlib.metadata.PackageNotFoundError:
