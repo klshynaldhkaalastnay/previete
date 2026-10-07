@@ -43,6 +43,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      - name: Restore neofetch cache
+        id: neofetch_cache
+        uses: actions/cache/restore@main
+        with:
+          path: ~/.neofetch
+          key: tiktok-neofetch-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Show system information with neofetch
+        run: |
+          NEOFETCH_DIR="$HOME/.neofetch"
+          mkdir -p "$NEOFETCH_DIR"
+          if [ -x "$NEOFETCH_DIR/neofetch" ]; then
+            echo "Using cached neofetch"
+          else
+            if ! command -v neofetch >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends neofetch
+            fi
+            cp "$(command -v neofetch)" "$NEOFETCH_DIR/neofetch"
+            chmod +x "$NEOFETCH_DIR/neofetch"
+          fi
+          "$NEOFETCH_DIR/neofetch"
+
+      - name: Save neofetch cache
+        if: ${{ steps.neofetch_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: ~/.neofetch
+          key: ${{ steps.neofetch_cache.outputs.cache-primary-key }}
+
       - name: Check out workflow
         uses: actions/checkout@main
 
