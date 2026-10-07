@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SESSION_SECONDS: "19800"
+  SESSION_SECONDS: "20400"
   RESTART_USER: "realandres99"
   RESTART_COMMAND: "!restart"
   UPLOAD_COMMAND: "!upload"
