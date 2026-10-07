@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SESSION_SECONDS: "19800"
+  SESSION_SECONDS: "20400"
   PYTHON_FILE: ${{ inputs.python_file }}
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
