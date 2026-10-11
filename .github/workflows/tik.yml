@@ -79,7 +79,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@main
         with:
-          python-version: '3.12'
+          python-version: '3.x'
+          check-latest: true
 
       - name: Restore imported application
         if: ${{ inputs.force_reimport != true }}
@@ -190,9 +191,9 @@ jobs:
         uses: actions/cache@main
         with:
           path: ~/.cache/pip
-          key: tiktok-pip-${{ runner.os }}-py312-${{ hashFiles('app/requirements.txt') }}
+          key: tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-${{ hashFiles('app/requirements.txt') }}
           restore-keys: |
-            tiktok-pip-${{ runner.os }}-py312-
+            tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-
 
       - name: Install dependencies
         id: dependencies
