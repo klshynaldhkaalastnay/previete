@@ -85,9 +85,10 @@ jobs:
         uses: actions/checkout@main
 
       - name: Set up Python
+        id: python
         uses: actions/setup-python@main
         with:
-          python-version: '3.x'
+          python-version: '>=3.12 <3.15'
           check-latest: true
 
       - name: Restore imported application
@@ -199,9 +200,9 @@ jobs:
         uses: actions/cache@main
         with:
           path: ~/.cache/pip
-          key: tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-${{ hashFiles('app/requirements.txt') }}
+          key: tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-${{ steps.python.outputs.python-version }}-${{ hashFiles('app/requirements.txt') }}
           restore-keys: |
-            tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-
+            tiktok-pip-${{ runner.os }}-${{ runner.arch }}-py-${{ steps.python.outputs.python-version }}-
 
       - name: Install dependencies
         id: dependencies
