@@ -43,6 +43,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      - name: Prepare Telegram reporting
+        run: |
+          python3 - <<'PYREPORT'
+          import os
+          from pathlib import Path
+          Path(os.environ['RUNNER_TEMP'], 'telegram_logs.py').write_text('"""Stdlib Telegram reporting, usable before application dependencies are installed."""\nimport datetime as dt\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport sys\nimport threading\nimport urllib.request\nimport uuid\n\nCHAT_ID = \'-1004434678187\'\nINTERVAL_SECONDS = 3600\nMAX_LOG_BYTES = 8 * 1024 * 1024\n\n\ndef sanitize(value):\n    for key, secret in sorted(os.environ.items(), key=lambda item: len(item[1]), reverse=True):\n        if secret and any(word in key.upper() for word in (\'TOKEN\', \'SECRET\', \'PASSWORD\', \'ACCESS_KEY\', \'COOKIES\')):\n            value = value.replace(secret, \'[redacted]\')\n    value = re.sub(r\'\\b\\d{6,}:[A-Za-z0-9_-]{20,}\\b\', \'[redacted]\', value)\n    value = re.sub(r\'(?im)((?:authorization|cookie|set-cookie)\\s*[:=])[^\\r\\n]*\', r\'\\1 [redacted]\', value)\n    return value\n\n\ndef warning():\n    print(\'Telegram log upload failed, reporting will continue at the next interval\', file=sys.stderr, flush=True)\n\n\ndef send_document(data, filename, caption):\n    token = os.getenv(\'TELEGRAM_BOT_TOKEN\', \'\').strip()\n    if not token:\n        warning()\n        return False\n    boundary = uuid.uuid4().hex\n    parts = []\n    for name, value in [(\'chat_id\', CHAT_ID), (\'caption\', caption)]:\n        parts.append(f\'--{boundary}\\r\\nContent-Disposition: form-data; name="{name}"\\r\\n\\r\\n{value}\\r\\n\'.encode())\n    parts.extend([\n        f\'--{boundary}\\r\\nContent-Disposition: form-data; name="document"; filename="{filename}"\\r\\nContent-Type: text/plain; charset=utf-8\\r\\n\\r\\n\'.encode(),\n        sanitize(data.decode(\'utf-8\', errors=\'replace\')).encode(),\n        f\'\\r\\n--{boundary}--\\r\\n\'.encode(),\n    ])\n    request = urllib.request.Request(\n        f\'https://api.telegram.org/bot{token}/sendDocument\', data=b\'\'.join(parts),\n        headers={\'Content-Type\': f\'multipart/form-data; boundary={boundary}\'}, method=\'POST\')\n    try:\n        with urllib.request.urlopen(request, timeout=30) as response:\n            if json.loads(response.read(65536)).get(\'ok\') is not True:\n                raise ValueError(\'Upload rejected\')\n        return True\n    except Exception:\n        # Never print the exception or API response: they can contain credentials\n        warning()\n        return False\n\n\nclass LogBuffer:\n    def __init__(self):\n        self.lines = []\n        self.size = 0\n        self.sequence = 0\n        self.truncated = False\n        self.lock = threading.Lock()\n\n    def append(self, line):\n        data = sanitize(line).encode(\'utf-8\', errors=\'replace\')\n        with self.lock:\n            self.sequence += 1\n            if len(data) > MAX_LOG_BYTES:\n                data = data[-MAX_LOG_BYTES:]\n                self.truncated = True\n            self.lines.append((self.sequence, data))\n            self.size += len(data)\n            while self.size > MAX_LOG_BYTES:\n                self.size -= len(self.lines.pop(0)[1])\n                self.truncated = True\n\n    def snapshot(self):\n        with self.lock:\n            prefix = b\'[Older log entries omitted to keep the file bounded]\\n\' if self.truncated else b\'\'\n            return self.sequence, prefix + b\'\'.join(data for _, data in self.lines)\n\n    def acknowledge(self, sequence):\n        with self.lock:\n            self.lines = [(seq, data) for seq, data in self.lines if seq > sequence]\n            self.size = sum(len(data) for _, data in self.lines)\n            self.truncated = False\n\n\ndef upload_logs(buffer, final=False):\n    sequence, data = buffer.snapshot()\n    if final and not data:\n        return\n    now = dt.datetime.now(dt.timezone.utc).strftime(\'%Y%m%dT%H%M%SZ\')\n    kind = \'final\' if final else \'hourly\'\n    header = f\'TikTok bot {kind} log, UTC {now}\\n\'\n    data = header.encode() + (data or b\'No bot log entries during this interval\\n\')\n    if send_document(data, f\'bot-log-{kind}-{now}.txt\', f\'TikTok bot {kind} log\'):\n        buffer.acknowledge(sequence)\n\n\ndef run_bot(script, interval=INTERVAL_SECONDS):\n    buffer = LogBuffer()\n    stopped = threading.Event()\n    child = subprocess.Popen([sys.executable, script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n    previous = {}\n\n    def forward(signum, frame):\n        if child.poll() is None:\n            child.send_signal(signum)\n\n    for signum in (signal.SIGINT, signal.SIGTERM):\n        previous[signum] = signal.signal(signum, forward)\n\n    def periodic():\n        while not stopped.wait(interval):\n            upload_logs(buffer)\n\n    reporter = threading.Thread(target=periodic, daemon=True)\n    reporter.start()\n    try:\n        # Bounded reads prevent a single unterminated line from exhausting memory\n        while True:\n            raw = child.stdout.readline(65536)\n            if not raw:\n                break\n            line = sanitize(raw.decode(\'utf-8\', errors=\'replace\'))\n            sys.stdout.write(line)\n            sys.stdout.flush()\n            buffer.append(line)\n        returncode = child.wait()\n    finally:\n        stopped.set()\n        if child.poll() is None:\n            child.terminate()\n            try:\n                child.wait(timeout=10)\n            except subprocess.TimeoutExpired:\n                child.kill()\n                child.wait()\n        child.stdout.close()\n        reporter.join()  # HTTP uploads have a finite timeout\n        for signum, handler in previous.items():\n            signal.signal(signum, handler)\n        upload_logs(buffer, final=True)\n    return returncode if returncode >= 0 else 128 - returncode\n\n\ndef main():\n    if len(sys.argv) != 3 or sys.argv[1] not in (\'run\', \'diagnostics\'):\n        raise SystemExit(\'Usage: telegram_logs.py run BOT.py | diagnostics FILE.txt\')\n    if sys.argv[1] == \'run\':\n        raise SystemExit(run_bot(sys.argv[2]))\n    try:\n        data = Path(sys.argv[2]).read_bytes()\n    except OSError:\n        warning()\n        return\n    send_document(data, \'diagnostics.txt\', \'TikTok bot diagnostics\')\n\n\nif __name__ == \'__main__\':\n    main()\n', encoding='utf-8')
+          PYREPORT
+
       - name: Restore neofetch cache
         id: neofetch_cache
         uses: actions/cache/restore@main
@@ -309,7 +317,7 @@ jobs:
                   fail('TIKTOK_COOKIES_BASE64 must contain a base64 encoded Netscape cookie file')
           print('Bot configuration validated')
           PYCONFIG
-          python "$BOT_SOURCE_DIR/bot.py"
+          python "$RUNNER_TEMP/telegram_logs.py" run "$BOT_SOURCE_DIR/bot.py"
           python "$BOT_SOURCE_DIR/backup.py" receipt
 
       - name: Back up to R2 and verify before pruning
@@ -364,10 +372,9 @@ jobs:
           Path('diagnostics.txt').write_text('\n'.join(lines)+'\n')
           PY
 
-      - name: Upload sanitized diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@main
-        with:
-          name: tiktok-bot-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: diagnostics.txt
-          retention-days: 7
+      - name: Send diagnostics to Telegram
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python3 "$RUNNER_TEMP/telegram_logs.py" diagnostics diagnostics.txt
