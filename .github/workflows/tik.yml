@@ -152,10 +152,11 @@ jobs:
               url = os.getenv('APP_ZIP_URL','').strip()
               refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
               required = ('bot.py','worker.py','state.py','common.py','backup.py',
-                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','compression.py','broadcasts.py')
+                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','video_compression.py','broadcasts.py')
               cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
                                    for name in required)
-              if refresh or not cache_complete:
+              legacy = (app/'compression.py').exists() or (app/'compression.py').is_symlink()
+              if refresh or not cache_complete or legacy:
                   if not url:
                       raise SystemExit('Set APP_ZIP_URL to the direct HTTPS download URL of your bot ZIP')
                   if not url.startswith('https://'):
@@ -172,6 +173,8 @@ jobs:
                                   raise ValueError('Bot ZIP is too large')
                               out.write(chunk)
                       extract_project(archive,app)
+              if (app/'compression.py').exists() or (app/'compression.py').is_symlink():
+                  raise SystemExit('Replace the hosted bot ZIP with the updated version containing video_compression.py')
               if any(not (app/name).is_file() or (app/name).is_symlink() for name in required):
                   raise SystemExit('Bot ZIP is missing required application files or workflow_tools.py')
               # Preserve the actual running workflow in future R2 backups
