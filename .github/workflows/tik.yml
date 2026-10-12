@@ -152,7 +152,7 @@ jobs:
               url = os.getenv('APP_ZIP_URL','').strip()
               refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
               required = ('bot.py','worker.py','state.py','common.py','backup.py',
-                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','video_compression.py','broadcasts.py')
+                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','video_compression.py','broadcasts.py','dependency_updates.py','metadata_files.py','metadata_formats.py')
               cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
                                    for name in required)
               legacy = (app/'compression.py').exists() or (app/'compression.py').is_symlink()
