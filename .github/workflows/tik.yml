@@ -350,7 +350,7 @@ jobs:
           git -C "$BOT_API_SOURCE_DIR" fetch --depth 1 origin "$BOT_API_SOURCE_SHA"
           git -C "$BOT_API_SOURCE_DIR" checkout --detach FETCH_HEAD
           git -C "$BOT_API_SOURCE_DIR" submodule update --init --recursive --depth 1
-          cmake -S "$BOT_API_SOURCE_DIR" -B "$BOT_API_SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/telegram-bot-api-install"
+          cmake -S "$BOT_API_SOURCE_DIR" -B "$BOT_API_SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/telegram-bot-api-install"
           cmake --build "$BOT_API_SOURCE_DIR/build" --target install --parallel 2
           mkdir -p "$HOME/.telegram-bot-api"
           install -m 755 "$RUNNER_TEMP/telegram-bot-api-install/bin/telegram-bot-api" "$HOME/.telegram-bot-api/telegram-bot-api"
