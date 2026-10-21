@@ -44,11 +44,13 @@ jobs:
     timeout-minutes: 355
     steps:
       - name: Prepare Telegram reporting
+        id: prepare_telegram_reporting
         run: |
           python3 - <<'PYREPORT'
           import os
           from pathlib import Path
-          Path(os.environ['RUNNER_TEMP'], 'telegram_logs.py').write_text('"""Stdlib Telegram reporting, usable before application dependencies are installed."""\nimport datetime as dt\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport sys\nimport threading\nimport urllib.request\nimport uuid\n\nCHAT_ID = \'-1004434678187\'\nINTERVAL_SECONDS = 3600\nMAX_LOG_BYTES = 8 * 1024 * 1024\n\n\ndef sanitize(value):\n    for key, secret in sorted(os.environ.items(), key=lambda item: len(item[1]), reverse=True):\n        if secret and any(word in key.upper() for word in (\'TOKEN\', \'SECRET\', \'PASSWORD\', \'ACCESS_KEY\', \'COOKIES\')):\n            value = value.replace(secret, \'[redacted]\')\n    value = re.sub(r\'\\b\\d{6,}:[A-Za-z0-9_-]{20,}\\b\', \'[redacted]\', value)\n    value = re.sub(r\'(?im)((?:authorization|cookie|set-cookie)\\s*[:=])[^\\r\\n]*\', r\'\\1 [redacted]\', value)\n    return value\n\n\ndef warning():\n    print(\'Telegram log upload failed, reporting will continue at the next interval\', file=sys.stderr, flush=True)\n\n\ndef send_document(data, filename, caption):\n    token = os.getenv(\'TELEGRAM_BOT_TOKEN\', \'\').strip()\n    if not token:\n        warning()\n        return False\n    boundary = uuid.uuid4().hex\n    parts = []\n    for name, value in [(\'chat_id\', CHAT_ID), (\'caption\', caption)]:\n        parts.append(f\'--{boundary}\\r\\nContent-Disposition: form-data; name="{name}"\\r\\n\\r\\n{value}\\r\\n\'.encode())\n    parts.extend([\n        f\'--{boundary}\\r\\nContent-Disposition: form-data; name="document"; filename="{filename}"\\r\\nContent-Type: text/plain; charset=utf-8\\r\\n\\r\\n\'.encode(),\n        sanitize(data.decode(\'utf-8\', errors=\'replace\')).encode(),\n        f\'\\r\\n--{boundary}--\\r\\n\'.encode(),\n    ])\n    request = urllib.request.Request(\n        f\'https://api.telegram.org/bot{token}/sendDocument\', data=b\'\'.join(parts),\n        headers={\'Content-Type\': f\'multipart/form-data; boundary={boundary}\'}, method=\'POST\')\n    try:\n        with urllib.request.urlopen(request, timeout=30) as response:\n            if json.loads(response.read(65536)).get(\'ok\') is not True:\n                raise ValueError(\'Upload rejected\')\n        return True\n    except Exception:\n        # Never print the exception or API response: they can contain credentials\n        warning()\n        return False\n\n\nclass LogBuffer:\n    def __init__(self):\n        self.lines = []\n        self.size = 0\n        self.sequence = 0\n        self.truncated = False\n        self.lock = threading.Lock()\n\n    def append(self, line):\n        data = sanitize(line).encode(\'utf-8\', errors=\'replace\')\n        with self.lock:\n            self.sequence += 1\n            if len(data) > MAX_LOG_BYTES:\n                data = data[-MAX_LOG_BYTES:]\n                self.truncated = True\n            self.lines.append((self.sequence, data))\n            self.size += len(data)\n            while self.size > MAX_LOG_BYTES:\n                self.size -= len(self.lines.pop(0)[1])\n                self.truncated = True\n\n    def snapshot(self):\n        with self.lock:\n            prefix = b\'[Older log entries omitted to keep the file bounded]\\n\' if self.truncated else b\'\'\n            return self.sequence, prefix + b\'\'.join(data for _, data in self.lines)\n\n    def acknowledge(self, sequence):\n        with self.lock:\n            self.lines = [(seq, data) for seq, data in self.lines if seq > sequence]\n            self.size = sum(len(data) for _, data in self.lines)\n            self.truncated = False\n\n\ndef upload_logs(buffer, final=False):\n    sequence, data = buffer.snapshot()\n    if final and not data:\n        return\n    now = dt.datetime.now(dt.timezone.utc).strftime(\'%Y%m%dT%H%M%SZ\')\n    kind = \'final\' if final else \'hourly\'\n    header = f\'TikTok bot {kind} log, UTC {now}\\n\'\n    data = header.encode() + (data or b\'No bot log entries during this interval\\n\')\n    if send_document(data, f\'bot-log-{kind}-{now}.txt\', f\'TikTok bot {kind} log\'):\n        buffer.acknowledge(sequence)\n\n\ndef run_bot(script, interval=INTERVAL_SECONDS):\n    buffer = LogBuffer()\n    stopped = threading.Event()\n    child = subprocess.Popen([sys.executable, script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n    previous = {}\n\n    def forward(signum, frame):\n        if child.poll() is None:\n            child.send_signal(signum)\n\n    for signum in (signal.SIGINT, signal.SIGTERM):\n        previous[signum] = signal.signal(signum, forward)\n\n    def periodic():\n        while not stopped.wait(interval):\n            upload_logs(buffer)\n\n    reporter = threading.Thread(target=periodic, daemon=True)\n    reporter.start()\n    try:\n        # Bounded reads prevent a single unterminated line from exhausting memory\n        while True:\n            raw = child.stdout.readline(65536)\n            if not raw:\n                break\n            line = sanitize(raw.decode(\'utf-8\', errors=\'replace\'))\n            sys.stdout.write(line)\n            sys.stdout.flush()\n            buffer.append(line)\n        returncode = child.wait()\n    finally:\n        stopped.set()\n        if child.poll() is None:\n            child.terminate()\n            try:\n                child.wait(timeout=10)\n            except subprocess.TimeoutExpired:\n                child.kill()\n                child.wait()\n        child.stdout.close()\n        reporter.join()  # HTTP uploads have a finite timeout\n        for signum, handler in previous.items():\n            signal.signal(signum, handler)\n        upload_logs(buffer, final=True)\n    return returncode if returncode >= 0 else 128 - returncode\n\n\ndef main():\n    if len(sys.argv) != 3 or sys.argv[1] not in (\'run\', \'diagnostics\'):\n        raise SystemExit(\'Usage: telegram_logs.py run BOT.py | diagnostics FILE.txt\')\n    if sys.argv[1] == \'run\':\n        raise SystemExit(run_bot(sys.argv[2]))\n    try:\n        data = Path(sys.argv[2]).read_bytes()\n    except OSError:\n        warning()\n        return\n    send_document(data, \'diagnostics.txt\', \'TikTok bot diagnostics\')\n\n\nif __name__ == \'__main__\':\n    main()\n', encoding='utf-8')
+          Path(os.environ['RUNNER_TEMP'], 'crash_reports.py').write_text('"""Safe application error events for the independent Telegram supervisor."""\nimport json\nimport logging\nimport os\nfrom pathlib import Path\nimport re\nimport sys\n\nEVENT_PREFIX = \'@@TIKTOK_ISSUE_V1@@\'\nMAX_DETAILS = 12000\n\n\ndef sanitize(value):\n    value = str(value)\n    for key, secret in sorted(os.environ.items(), key=lambda item: len(item[1]), reverse=True):\n        if secret and any(word in key.upper() for word in (\'TOKEN\', \'SECRET\', \'PASSWORD\', \'ACCESS_KEY\', \'COOKIES\', \'ZIP_URL\', \'TELE_ZIP\')):\n            value = value.replace(secret, \'[redacted]\')\n    value = re.sub(r\'\\b\\d{6,}:[A-Za-z0-9_-]{20,}\\b\', \'[redacted]\', value)\n    value = re.sub(r\'(?im)((?:authorization|cookie|set-cookie)\\s*[:=])[^\\r\\n]*\', r\'\\1 [redacted]\', value)\n    value = re.sub(r\'(https?://)[^\\s/@]+:[^\\s/@]+@\', r\'\\1[redacted]@\', value)\n    value = re.sub(r\'(?i)([?&](?:token|key|signature|sig|password|secret|auth|credential|x-amz-[\\w-]+)=)[^\\s&#\\"\\\']+\', r\'\\1[redacted]\', value)\n    return value\n\n\ndef exception_details(exc):\n    # Exception strings, source lines, locals and Telegram method reprs can\n    # contain tokens, cookies, captions or signed URLs, so keep only locations.\n    lines, seen = [], set()\n    while exc is not None and id(exc) not in seen and len(seen) < 8:\n        seen.add(id(exc))\n        lines.append(type(exc).__name__)\n        frame = exc.__traceback__\n        for _ in range(40):\n            if frame is None:\n                break\n            code = frame.tb_frame.f_code\n            lines.append(f\'  {Path(code.co_filename).name}:{frame.tb_lineno} in {code.co_name}\')\n            frame = frame.tb_next\n        if type(exc).__name__ == \'TelegramConflictError\':\n            lines.append(\'Another application is polling with this bot token, stop the other bot instance\')\n        elif type(exc).__name__ == \'TelegramUnauthorizedError\':\n            lines.append(\'Telegram rejected the bot token, check TELEGRAM_BOT_TOKEN\')\n        if isinstance(exc, OSError) and isinstance(exc.errno, int):\n            lines.append(f\'OS error number: {exc.errno}\')\n        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)\n        if exc is not None:\n            lines.append(\'Caused by\')\n    return sanitize(\'\\n\'.join(lines))[:MAX_DETAILS]\n\n\ndef emit_issue(title, details=\'\', kind=\'error\'):\n    try:\n        event = {\'kind\': kind, \'title\': sanitize(title)[:500],\n                 \'details\': sanitize(details)[:MAX_DETAILS]}\n        print(EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)\n    except Exception:\n        # Reporting must never replace the application\'s original failure.\n        pass\n\n\nclass SafeFormatter(logging.Formatter):\n    def formatException(self, exc_info):\n        return exception_details(exc_info[1])\n\n    def format(self, record):\n        return sanitize(super().format(record))\n\n\nclass IssueHandler(logging.Handler):\n    def __init__(self):\n        super().__init__(logging.WARNING)\n\n    def emit(self, record):\n        try:\n            kind = getattr(record, \'report_kind\', \'warning\' if record.levelno == logging.WARNING else \'error\')\n            details = exception_details(record.exc_info[1]) if record.exc_info else \'\'\n            emit_issue(record.getMessage(), details, kind)\n        except Exception:\n            pass\n\n\ndef configure_logging():\n    stream = logging.StreamHandler(sys.stderr)\n    stream.setFormatter(SafeFormatter(\'%(asctime)s | %(levelname)s | %(message)s\'))\n    logging.basicConfig(level=logging.INFO, handlers=[stream, IssueHandler()], force=True)\n\n\ndef background_error(loop, context):\n    exc = context.get(\'exception\')\n    logging.error(\'Background task failed\', exc_info=(type(exc), exc, exc.__traceback__) if exc else None)\n', encoding='utf-8')
+          Path(os.environ['RUNNER_TEMP'], 'telegram_logs.py').write_text('"""Stdlib Telegram reporting, usable before application dependencies are installed."""\nimport datetime as dt\nfrom collections import OrderedDict\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport sys\nimport threading\nimport time\nimport urllib.request\nimport uuid\n\nfrom crash_reports import EVENT_PREFIX, MAX_DETAILS, exception_details, sanitize\n\nCHAT_ID = \'-1004434678187\'\nINTERVAL_SECONDS = 3600\nMAX_LOG_BYTES = 8 * 1024 * 1024\nMAX_CONTEXT_BYTES = 96 * 1024\nERROR_INTERVAL_SECONDS = 5\nERROR_REPEAT_SECONDS = 300\n\n\ndef timestamp():\n    return dt.datetime.now(dt.timezone.utc).strftime(\'%Y%m%dT%H%M%SZ\')\n\n\ndef run_url():\n    server = os.getenv(\'GITHUB_SERVER_URL\', \'https://github.com\').rstrip(\'/\')\n    repo, run = os.getenv(\'GITHUB_REPOSITORY\', \'\'), os.getenv(\'GITHUB_RUN_ID\', \'\')\n    if re.fullmatch(r\'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\', repo) and run.isascii() and run.isdecimal():\n        return sanitize(f\'{server}/{repo}/actions/runs/{run}\')\n    return \'\'\n\n\ndef warning():\n    print(\'Telegram report upload failed, bot and workflow exit status are preserved\', file=sys.stderr, flush=True)\n\n\ndef send_document(data, filename, caption):\n    token = os.getenv(\'TELEGRAM_BOT_TOKEN\', \'\').strip()\n    if not token:\n        warning()\n        return False\n    boundary = uuid.uuid4().hex\n    parts = []\n    for name, value in [(\'chat_id\', CHAT_ID), (\'caption\', sanitize(caption))]:\n        parts.append(f\'--{boundary}\\r\\nContent-Disposition: form-data; name="{name}"\\r\\n\\r\\n{value}\\r\\n\'.encode())\n    parts.extend([\n        f\'--{boundary}\\r\\nContent-Disposition: form-data; name="document"; filename="{filename}"\\r\\nContent-Type: text/plain; charset=utf-8\\r\\n\\r\\n\'.encode(),\n        sanitize(data.decode(\'utf-8\', errors=\'replace\')).encode(),\n        f\'\\r\\n--{boundary}--\\r\\n\'.encode(),\n    ])\n    request = urllib.request.Request(\n        f\'https://api.telegram.org/bot{token}/sendDocument\', data=b\'\'.join(parts),\n        headers={\'Content-Type\': f\'multipart/form-data; boundary={boundary}\'}, method=\'POST\')\n    try:\n        with urllib.request.urlopen(request, timeout=30) as response:\n            if json.loads(response.read(65536)).get(\'ok\') is not True:\n                raise ValueError(\'Upload rejected\')\n        return True\n    except Exception:\n        # Never print the exception or API response: they can contain credentials\n        warning()\n        return False\n\n\nclass LogBuffer:\n    def __init__(self, limit=None):\n        self.lines = []\n        self.size = 0\n        self.sequence = 0\n        self.truncated = False\n        self.lock = threading.Lock()\n        self.limit = MAX_LOG_BYTES if limit is None else limit\n\n    def append(self, line):\n        data = sanitize(line).encode(\'utf-8\', errors=\'replace\')\n        with self.lock:\n            self.sequence += 1\n            if len(data) > self.limit:\n                data = data[-self.limit:]\n                self.truncated = True\n            self.lines.append((self.sequence, data))\n            self.size += len(data)\n            while self.size > self.limit:\n                self.size -= len(self.lines.pop(0)[1])\n                self.truncated = True\n\n    def snapshot(self):\n        with self.lock:\n            prefix = b\'[Older log entries omitted to keep the file bounded]\\n\' if self.truncated else b\'\'\n            return self.sequence, prefix + b\'\'.join(data for _, data in self.lines)\n\n    def acknowledge(self, sequence):\n        with self.lock:\n            self.lines = [(seq, data) for seq, data in self.lines if seq > sequence]\n            self.size = sum(len(data) for _, data in self.lines)\n            self.truncated = False\n\n\ndef upload_logs(buffer, final=False):\n    sequence, data = buffer.snapshot()\n    if final and not data:\n        return\n    now = timestamp()\n    kind = \'final\' if final else \'hourly\'\n    header = f\'TikTok bot {kind} log, UTC {now}\\n\'\n    data = header.encode() + (data or b\'No bot log entries during this interval\\n\')\n    if send_document(data, f\'bot-log-{kind}-{now}.txt\', f\'TikTok bot {kind} log\'):\n        buffer.acknowledge(sequence)\n\n\ndef parse_issue(line):\n    if not line.startswith(EVENT_PREFIX):\n        return None\n    try:\n        event = json.loads(line[len(EVENT_PREFIX):])\n        if not isinstance(event, dict) or event.get(\'kind\') not in (\'warning\', \'error\', \'crash\'):\n            return None\n        if not isinstance(event.get(\'title\'), str) or not isinstance(event.get(\'details\', \'\'), str):\n            return None\n        return {\'kind\': event[\'kind\'], \'title\': sanitize(event[\'title\'])[:500],\n                \'details\': sanitize(event.get(\'details\', \'\'))[:MAX_DETAILS]}\n    except (ValueError, TypeError, RecursionError):\n        return None\n\n\nclass IssueBuffer:\n    """Bounded error groups, independent of the acknowledged hourly log."""\n    def __init__(self, context):\n        self.context = context\n        self.pending = OrderedDict()\n        self.sent = OrderedDict()\n        self.lock = threading.Lock()\n\n    def append(self, event):\n        key = event[\'kind\'], re.sub(r\'\\bjob \\d+\\b\', \'job <id>\', event[\'title\'], flags=re.I)\n        with self.lock:\n            if key not in self.pending and len(self.pending) >= 40:\n                key = (\'warning\', \'Additional runtime errors\')\n                event = {\'kind\': \'warning\', \'title\': key[1], \'details\': \'\'}\n            previous = self.pending.get(key, {\'count\': 0})\n            self.pending[key] = dict(event, count=previous[\'count\'] + 1)\n\n    def flush(self, final=False):\n        now = time.monotonic()\n        with self.lock:\n            groups = [(key, value.copy()) for key, value in self.pending.items()\n                      if final or key not in self.sent or now-self.sent[key] >= ERROR_REPEAT_SECONDS]\n        if not groups:\n            return\n        tag = \'#error\' if any(value[\'kind\'] == \'error\' for _, value in groups) else \'#warning\'\n        summary = \'\\n\'.join(f"{value[\'title\']} (×{value[\'count\']})" for _, value in groups)\n        # The short caption stays below Telegram\'s 1024 UTF-16-unit limit.\n        caption = tag + \'\\n\\n\' + summary[:300]\n        link = run_url()\n        if link:\n            caption += \'\\n\\nRun: \' + link\n        details = \'\\n\\n\'.join(f"{value[\'title\']}\\nOccurrences: {value[\'count\']}\\n{value[\'details\']}"\n                              for _, value in groups)\n        data = (tag + \'\\nUTC: \' + timestamp() + \'\\nRun: \' + link + \'\\n\\n\' + details).encode()\n        data += b\'\\n\\nRecent bot log\\n\' + self.context.snapshot()[1]\n        if not send_document(data, f\'bot-errors-{timestamp()}.txt\', caption):\n            return\n        with self.lock:\n            for key, value in groups:\n                current = self.pending.get(key)\n                if current is not None:\n                    current[\'count\'] -= value[\'count\']\n                    if current[\'count\'] <= 0:\n                        del self.pending[key]\n                self.sent[key] = now\n                self.sent.move_to_end(key)\n            while len(self.sent) > 200:\n                self.sent.popitem(last=False)\n\n\ndef marker_path():\n    temp = os.getenv(\'RUNNER_TEMP\')\n    return Path(temp)/\'tiktok-crash-reported.json\' if temp else None\n\n\ndef crash_reported():\n    path = marker_path()\n    try:\n        marker = json.loads(path.read_text()) if path else {}\n        return bool(marker and marker.get(\'run\') == os.getenv(\'GITHUB_RUN_ID\', \'\')\n                    and marker.get(\'attempt\') == os.getenv(\'GITHUB_RUN_ATTEMPT\', \'\'))\n    except (OSError, ValueError, TypeError):\n        return False\n\n\ndef report_crash(returncode, context, event=None):\n    event = event or {\'title\': \'Bot process stopped unexpectedly\', \'details\': \'\'}\n    title = f"{event[\'title\']}\\nExit code: {returncode}"\n    link = run_url()\n    caption = \'#crash\\n\\n\' + title[:240]\n    if event.get(\'details\'):\n        caption += \'\\n\' + event[\'details\'].splitlines()[0][:120]\n    if link:\n        caption += \'\\n\\nRun: \' + link\n    data = (caption + \'\\nUTC: \' + timestamp() + \'\\n\\n\' + event.get(\'details\', \'\')).encode()\n    data += b\'\\n\\nRecent bot log\\n\' + context.snapshot()[1]\n    if send_document(data, f\'bot-crash-{timestamp()}.txt\', caption):\n        path = marker_path()\n        if path:\n            try:\n                path.write_text(json.dumps({\'run\': os.getenv(\'GITHUB_RUN_ID\', \'\'),\n                                            \'attempt\': os.getenv(\'GITHUB_RUN_ATTEMPT\', \'\')}))\n            except OSError:\n                pass\n        return True\n    return False\n\n\ndef workflow_issues():\n    try:\n        steps = json.loads(os.getenv(\'WORKFLOW_STEPS\', \'{}\'))\n    except ValueError:\n        steps = {}\n    if not isinstance(steps, dict):\n        steps = {}\n    # Do not copy step outputs, they can include credentials or private URLs.\n    return [(name, step.get(\'outcome\')) for name, step in steps.items()\n            if re.fullmatch(r\'[A-Za-z_][A-Za-z0-9_-]{0,79}\', name) and isinstance(step, dict)\n            and step.get(\'outcome\') in (\'failure\', \'cancelled\')][:50]\n\n\ndef report_workflow(data):\n    issues = workflow_issues()\n    status = os.getenv(\'WORKFLOW_STATUS\', \'\')\n    if status not in (\'failure\', \'cancelled\') and not issues:\n        return\n    if issues and all(name == \'session\' for name, _ in issues) and crash_reported():\n        return  # The supervisor already delivered this particular crash.\n    tag = \'#error\' if status == \'failure\' or any(outcome == \'failure\' for _, outcome in issues) else \'#warning\'\n    title = \'Workflow failed\' if tag == \'#error\' else \'Workflow was cancelled\'\n    lines = [tag, \'\', title, *[f\'{name}: {outcome}\' for name, outcome in issues]]\n    if link := run_url():\n        lines.extend([\'\', \'Run: \' + link])\n    caption = \'\\n\'.join([tag, \'\', title, *[f\'{name}: {outcome}\' for name, outcome in issues[:2]]])[:350]\n    if link:\n        caption += \'\\n\\nRun: \' + link\n    document = \'\\n\'.join(lines).encode() + b\'\\n\\n\' + data\n    send_document(document, f\'workflow-error-{timestamp()}.txt\', caption)\n\n\ndef run_bot(script, interval=INTERVAL_SECONDS):\n    buffer = LogBuffer()\n    context = LogBuffer(MAX_CONTEXT_BYTES)\n    issues = IssueBuffer(context)\n    fatal = None\n    returncode = 1\n    stopped = threading.Event()\n    # Ensure the application\'s final event arrives even when stdout is a pipe.\n    try:\n        child = subprocess.Popen([sys.executable, \'-u\', script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n    except Exception as exc:\n        report_crash(1, context, {\'title\': \'Could not start the bot process\', \'details\': exception_details(exc)})\n        return 1\n    previous = {}\n\n    def forward(signum, frame):\n        if child.poll() is None:\n            child.send_signal(signum)\n\n    for signum in (signal.SIGINT, signal.SIGTERM):\n        previous[signum] = signal.signal(signum, forward)\n\n    def periodic():\n        next_log = time.monotonic()+interval\n        while not stopped.wait(min(ERROR_INTERVAL_SECONDS, max(0, next_log-time.monotonic()))):\n            issues.flush()\n            if time.monotonic() >= next_log:\n                upload_logs(buffer)\n                next_log = time.monotonic()+interval\n\n    reporter = threading.Thread(target=periodic, daemon=True)\n    reporter.start()\n    try:\n        # Bounded reads prevent a single unterminated line from exhausting memory\n        while True:\n            raw = child.stdout.readline(65536)\n            if not raw:\n                break\n            decoded = raw.decode(\'utf-8\', errors=\'replace\')\n            event = parse_issue(decoded)\n            if event:\n                if event[\'kind\'] == \'crash\':\n                    fatal = event\n                else:\n                    issues.append(event)\n                continue\n            line = sanitize(decoded)\n            sys.stdout.write(line)\n            sys.stdout.flush()\n            buffer.append(line)\n            context.append(line)\n        returncode = child.wait()\n    except Exception as exc:\n        fatal = {\'title\': \'Bot supervisor failed\', \'details\': exception_details(exc)}\n        returncode = 1\n    finally:\n        stopped.set()\n        if child.poll() is None:\n            child.terminate()\n            try:\n                child.wait(timeout=10)\n            except subprocess.TimeoutExpired:\n                child.kill()\n                child.wait()\n        child.stdout.close()\n        # The context survives hourly acknowledgement, even for a silent crash.\n        # A slow hourly upload must not delay the crash alert.\n        if returncode != 0 or fatal:\n            report_crash(returncode if returncode >= 0 else 128-returncode, context, fatal)\n        reporter.join()  # HTTP uploads have a finite timeout\n        for signum, handler in previous.items():\n            signal.signal(signum, handler)\n        issues.flush(final=True)\n        upload_logs(buffer, final=True)\n    return returncode if returncode >= 0 else 128 - returncode\n\n\ndef main():\n    if len(sys.argv) != 3 or sys.argv[1] not in (\'run\', \'diagnostics\'):\n        raise SystemExit(\'Usage: telegram_logs.py run BOT.py | diagnostics FILE.txt\')\n    if sys.argv[1] == \'run\':\n        raise SystemExit(run_bot(sys.argv[2]))\n    try:\n        data = Path(sys.argv[2]).read_bytes()\n    except OSError:\n        warning()\n        data = b\'Diagnostics file was unavailable\\n\'\n    report_workflow(data)\n    send_document(data, \'diagnostics.txt\', \'TikTok bot diagnostics\')\n\n\nif __name__ == \'__main__\':\n    main()\n', encoding='utf-8')
           PYREPORT
 
       - name: Restore neofetch cache
@@ -59,6 +61,7 @@ jobs:
           key: tiktok-neofetch-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Show system information with neofetch
+        id: show_system_information_with_neofetch
         run: |
           NEOFETCH_DIR="$HOME/.neofetch"
           mkdir -p "$NEOFETCH_DIR"
@@ -75,6 +78,7 @@ jobs:
           "$NEOFETCH_DIR/neofetch"
 
       - name: Save neofetch cache
+        id: save_neofetch_cache
         if: ${{ steps.neofetch_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@main
         with:
@@ -82,6 +86,7 @@ jobs:
           key: ${{ steps.neofetch_cache.outputs.cache-primary-key }}
 
       - name: Check out workflow
+        id: check_out_workflow
         uses: actions/checkout@main
 
       - name: Set up Python
@@ -92,6 +97,7 @@ jobs:
           check-latest: true
 
       - name: Restore imported application
+        id: restore_imported_application
         if: ${{ inputs.force_reimport != true }}
         uses: actions/cache/restore@main
         with:
@@ -101,6 +107,7 @@ jobs:
             tiktok-source-${{ runner.os }}-${{ github.ref_name }}-
 
       - name: Import application from ZIP or reuse cache
+        id: import_application_from_zip_or_reuse_cache
         env:
           APP_ZIP_URL: ${{ secrets.TELE_ZIP }}
           FORCE_REIMPORT: ${{ inputs.force_reimport }}
@@ -152,7 +159,8 @@ jobs:
               url = os.getenv('APP_ZIP_URL','').strip()
               refresh = os.getenv('FORCE_REIMPORT','false') == 'true'
               required = ('bot.py','worker.py','state.py','common.py','backup.py',
-                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','video_compression.py','broadcasts.py','dependency_updates.py','metadata_files.py','metadata_formats.py')
+                          'workflow_tools.py','requirements.txt','i18n.py','sound_browser.py','video_compression.py','broadcasts.py','dependency_updates.py','metadata_files.py','metadata_formats.py',
+                          'telegram_logs.py','crash_reports.py')
               cache_complete = all((app/name).is_file() and not (app/name).is_symlink()
                                    for name in required)
               legacy = (app/'compression.py').exists() or (app/'compression.py').is_symlink()
@@ -200,6 +208,7 @@ jobs:
           PY
 
       - name: Cache pip downloads
+        id: cache_pip_downloads
         uses: actions/cache@main
         with:
           path: ~/.cache/pip
@@ -227,6 +236,7 @@ jobs:
           key: tiktok-ffmpeg-${{ runner.os }}-${{ runner.arch }}-yt-dlp-linux64-gpl-v1
 
       - name: Install and check FFmpeg
+        id: install_and_check_ffmpeg
         run: |
           set -euo pipefail
           FF_DIR="$HOME/.ffmpeg"
@@ -253,6 +263,7 @@ jobs:
           ffprobe -version
 
       - name: Save FFmpeg cache
+        id: save_ffmpeg_cache
         if: ${{ steps.ffmpeg_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@main
         with:
@@ -260,6 +271,7 @@ jobs:
           key: ${{ steps.ffmpeg_cache.outputs.cache-primary-key }}
 
       - name: Cache Chromium
+        id: cache_chromium
         # Browser binaries remain separate from video encoding and user data.
         uses: actions/cache@main
         with:
@@ -267,12 +279,15 @@ jobs:
           key: tiktok-chromium-${{ runner.os }}-${{ runner.arch }}-pw-${{ steps.dependencies.outputs.playwright_version }}
 
       - name: Install Chromium for sound links
+        id: install_chromium_for_sound_links
         run: python -m playwright install --with-deps --no-shell chromium
 
       - name: Check R2 configuration
+        id: check_r2_configuration
         run: python "$BOT_SOURCE_DIR/backup.py" check
 
       - name: Restore queue cache
+        id: restore_queue_cache
         uses: actions/cache/restore@main
         with:
           path: state/state.db
@@ -281,6 +296,7 @@ jobs:
             tiktok-state-${{ runner.os }}-${{ github.ref_name }}-
 
       - name: Validate state or restore R2 backup
+        id: validate_state_or_restore_r2_backup
         run: python "$BOT_SOURCE_DIR/backup.py" restore
 
       - name: Run bot
@@ -325,10 +341,12 @@ jobs:
           python "$BOT_SOURCE_DIR/backup.py" receipt
 
       - name: Back up to R2 and verify before pruning
+        id: back_up_to_r2_and_verify_before_pruning
         if: ${{ success() && steps.session.outputs.ok == 'true' }}
         run: python "$BOT_SOURCE_DIR/backup.py" backup
 
       - name: Save queue cache
+        id: save_queue_cache
         if: ${{ success() && steps.session.outputs.ok == 'true' }}
         uses: actions/cache/save@main
         with:
@@ -336,6 +354,7 @@ jobs:
           key: tiktok-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Save imported application
+        id: save_imported_application
         if: ${{ success() && steps.session.outputs.ok == 'true' }}
         uses: actions/cache/save@main
         with:
@@ -343,12 +362,14 @@ jobs:
           key: tiktok-source-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify saved cache and prune older bot caches
+        id: verify_saved_cache_and_prune_older_bot_caches
         if: ${{ success() && steps.session.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: python "$BOT_SOURCE_DIR/workflow_tools.py" prune
 
       - name: Start next session
+        id: start_next_session
         if: ${{ success() && steps.session.outputs.ok == 'true' && steps.session.outputs.reason != 'shutdown' && (inputs.continue || steps.session.outputs.reason == 'restart' || steps.session.outputs.reason == 'upload') }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -356,10 +377,12 @@ jobs:
         run: python "$BOT_SOURCE_DIR/workflow_tools.py" dispatch
 
       - name: Write sanitized diagnostics
+        id: write_sanitized_diagnostics
         if: ${{ always() }}
         env:
           SESSION_OK: ${{ steps.session.outputs.ok }}
           SESSION_REASON: ${{ steps.session.outputs.reason }}
+          WORKFLOW_STATUS: ${{ job.status }}
         run: |
           python - <<'PY'
           import importlib.metadata
@@ -367,7 +390,8 @@ jobs:
           from pathlib import Path
           lines = ['TikTok bot diagnostics',
                    'Session completed: '+os.getenv('SESSION_OK',''),
-                   'Stop reason: '+os.getenv('SESSION_REASON','')]
+                   'Stop reason: '+os.getenv('SESSION_REASON',''),
+                   'Workflow status: '+os.getenv('WORKFLOW_STATUS','')]
           for package in ('gallery-dl','aiogram','boto3','Pillow'):
               try:
                   lines.append(package+': '+importlib.metadata.version(package))
@@ -377,8 +401,11 @@ jobs:
           PY
 
       - name: Send diagnostics to Telegram
+        id: send_diagnostics_to_telegram
         if: always()
         continue-on-error: true
         env:
+          WORKFLOW_STATUS: ${{ job.status }}
+          WORKFLOW_STEPS: ${{ toJSON(steps) }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python3 "$RUNNER_TEMP/telegram_logs.py" diagnostics diagnostics.txt
