@@ -95,7 +95,8 @@ jobs:
       uses: actions/setup-python@main
       id: python
       with:
-        python-version: '3.x'
+        python-version: '>=3.12 <3.15'
+        check-latest: true
     - name: Restore imported application
       uses: actions/cache/restore@main
       id: source_cache
@@ -132,7 +133,7 @@ jobs:
             complete = all((app/name).is_file() and not (app/name).is_symlink() for name in required)
             if os.getenv('FORCE_REIMPORT')=='true' or not complete:
                 if not url.startswith('https://'):
-                    raise SystemExit('Set TELE_ZIP to the direct HTTPS ZIP URL, or commit the complete bot source')
+                    raise SystemExit('Set WHISPER_ZIP to the direct HTTPS ZIP URL, or commit the complete bot source')
                 try:
                     with tempfile.TemporaryDirectory() as td:
                         archive = Path(td)/'bot.zip'
