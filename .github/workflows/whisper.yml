@@ -1,0 +1,468 @@
+# Managed local Telegram Bot API, using TELEGRAM_API_ID and TELEGRAM_API_HASH
+name: Whisper Telegram Bot
+'on':
+  workflow_dispatch:
+    inputs:
+      continue:
+        description: Start another session after a clean run
+        required: true
+        default: true
+        type: boolean
+      force_reimport:
+        description: Refresh the source ZIP, preserving the queue and settings
+        required: true
+        default: false
+        type: boolean
+      model:
+        description: Default Whisper model for users without a saved choice
+        required: true
+        default: base
+        type: choice
+        options:
+        - tiny
+        - base
+        - small
+        - medium
+        - large
+        - turbo
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: whisper-telegram-bot
+  cancel-in-progress: false
+env:
+  SESSION_SECONDS: '20400'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  BOT_DATA_DIR: ${{ github.workspace }}/state
+  WHISPER_MODEL_DIR: ${{ github.workspace }}/models
+  WHISPER_MODEL: ${{ inputs.model || 'base' }}
+  WHISPER_DEVICE: cpu
+  MAX_INPUT_MB: ${{ vars.MAX_INPUT_MB || '2000' }}
+  MAX_DURATION_SECONDS: ${{ vars.MAX_DURATION_SECONDS || '3600' }}
+  TRANSCRIBE_TIMEOUT_SECONDS: ${{ vars.TRANSCRIBE_TIMEOUT_SECONDS || '7200' }}
+  REPORT_CHAT_ID: ${{ secrets.REPORT_CHAT_ID || vars.REPORT_CHAT_ID || '-1004434678187' }}
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+  TELEGRAM_LOCAL_API_REQUIRED: 'true'
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+    - name: Prepare Telegram reporting and session deadline
+      id: reporting
+      run: |
+        python3 - <<'PY'
+        import os, time
+        from pathlib import Path
+        Path(os.environ['RUNNER_TEMP'], 'telegram_api.py').write_text('"""Shared Telegram endpoint and upload limits, usable before pip installs."""\nimport os\nfrom urllib.parse import urlsplit\n\nCLOUD_API = \'https://api.telegram.org\'\nLOCAL_API = \'http://127.0.0.1:8081\'\nLARGE_VIDEO_BYTES = 50_000_000\n\n\ndef api_base():\n    # Preserve the earlier bot\'s custom endpoint setting for existing local installs.\n    if not os.getenv(\'TELEGRAM_API_BASE\') and os.getenv(\'BOT_API_BASE_URL\'):\n        base = os.environ[\'BOT_API_BASE_URL\'].strip().rstrip(\'/\')\n        parsed = urlsplit(base)\n        if (parsed.scheme not in (\'http\', \'https\') or not parsed.hostname or parsed.username\n                or parsed.password or parsed.query or parsed.fragment):\n            raise ValueError(\'Invalid custom Telegram Bot API URL\')\n        return base\n    base = os.getenv(\'TELEGRAM_API_BASE\', CLOUD_API).strip().rstrip(\'/\')\n    parsed = urlsplit(base)\n    if (base != CLOUD_API and\n            (parsed.scheme != \'http\' or parsed.hostname not in (\'127.0.0.1\', \'localhost\')\n             or parsed.port not in (8081, 8082) or parsed.path or parsed.query\n             or parsed.fragment or parsed.username or parsed.password)):\n        raise ValueError(\'Use the cloud Bot API or the loopback local Bot API\')\n    return base\n\n\ndef is_local():\n    return api_base() != CLOUD_API\n\n\ndef local_file_access():\n    # The managed loopback server shares the runner filesystem with aiogram.\n    # Legacy external servers keep their explicit shared-filesystem opt-in.\n    return is_local() and (bool(os.getenv(\'TELEGRAM_API_BASE\')) or\n                          os.getenv(\'BOT_API_IS_LOCAL\', \'false\').lower() == \'true\')\n\n\nMAX_BYTES = 2_000_000_000 if is_local() else LARGE_VIDEO_BYTES\nUPLOAD_TIMEOUT = 3600 if is_local() else 150\n', encoding='utf-8')
+        Path(os.environ['RUNNER_TEMP'], 'crash_reports.py').write_text('"""Safe application error events for the independent Telegram supervisor."""\nimport json\nimport logging\nimport os\nfrom pathlib import Path\nimport re\nimport sys\n\nEVENT_PREFIX = \'@@WHISPER_ISSUE_V1@@\'\nMAX_DETAILS = 12000\n\n\ndef sanitize(value):\n    value = str(value)\n    for key, secret in sorted(os.environ.items(), key=lambda item: len(item[1]), reverse=True):\n        if secret and any(word in key.upper() for word in (\'TOKEN\', \'SECRET\', \'PASSWORD\', \'ACCESS_KEY\', \'COOKIES\', \'API_HASH\', \'ZIP_URL\', \'TELE_ZIP\')):\n            value = value.replace(secret, \'[redacted]\')\n    value = re.sub(r\'\\b\\d{6,}:[A-Za-z0-9_-]{20,}\\b\', \'[redacted]\', value)\n    value = re.sub(r\'(?im)((?:authorization|cookie|set-cookie)\\s*[:=])[^\\r\\n]*\', r\'\\1 [redacted]\', value)\n    value = re.sub(r\'(https?://)[^\\s/@]+:[^\\s/@]+@\', r\'\\1[redacted]@\', value)\n    value = re.sub(r\'(?i)([?&](?:token|key|signature|sig|password|secret|auth|credential|x-amz-[\\w-]+)=)[^\\s&#\\"\\\']+\', r\'\\1[redacted]\', value)\n    return value\n\n\ndef exception_details(exc):\n    # Exception strings, source lines, locals and Telegram method reprs can\n    # contain tokens, cookies, captions or signed URLs, so keep only locations.\n    lines, seen = [], set()\n    while exc is not None and id(exc) not in seen and len(seen) < 8:\n        seen.add(id(exc))\n        lines.append(type(exc).__name__)\n        frame = exc.__traceback__\n        for _ in range(40):\n            if frame is None:\n                break\n            code = frame.tb_frame.f_code\n            lines.append(f\'  {Path(code.co_filename).name}:{frame.tb_lineno} in {code.co_name}\')\n            frame = frame.tb_next\n        if type(exc).__name__ == \'TelegramConflictError\':\n            lines.append(\'Another application is polling with this bot token, stop the other bot instance\')\n        elif type(exc).__name__ == \'TelegramUnauthorizedError\':\n            lines.append(\'Telegram rejected the bot token, check TELEGRAM_BOT_TOKEN\')\n        if isinstance(exc, OSError) and isinstance(exc.errno, int):\n            lines.append(f\'OS error number: {exc.errno}\')\n        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)\n        if exc is not None:\n            lines.append(\'Caused by\')\n    return sanitize(\'\\n\'.join(lines))[:MAX_DETAILS]\n\n\ndef emit_issue(title, details=\'\', kind=\'error\'):\n    try:\n        event = {\'kind\': kind, \'title\': sanitize(title)[:500],\n                 \'details\': sanitize(details)[:MAX_DETAILS]}\n        print(EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)\n    except Exception:\n        # Reporting must never replace the application\'s original failure.\n        pass\n\n\nclass SafeFormatter(logging.Formatter):\n    def formatException(self, exc_info):\n        return exception_details(exc_info[1])\n\n    def format(self, record):\n        return sanitize(super().format(record))\n\n\nclass IssueHandler(logging.Handler):\n    def __init__(self):\n        super().__init__(logging.WARNING)\n\n    def emit(self, record):\n        try:\n            kind = getattr(record, \'report_kind\', \'warning\' if record.levelno == logging.WARNING else \'error\')\n            details = exception_details(record.exc_info[1]) if record.exc_info else \'\'\n            emit_issue(record.getMessage(), details, kind)\n        except Exception:\n            pass\n\n\ndef configure_logging():\n    stream = logging.StreamHandler(sys.stderr)\n    stream.setFormatter(SafeFormatter(\'%(asctime)s | %(levelname)s | %(message)s\'))\n    logging.basicConfig(level=logging.INFO, handlers=[stream, IssueHandler()], force=True)\n\n\ndef background_error(loop, context):\n    exc = context.get(\'exception\')\n    logging.error(\'Background task failed\', exc_info=(type(exc), exc, exc.__traceback__) if exc else None)\n', encoding='utf-8')
+        with open(os.environ['GITHUB_ENV'],'a') as out:
+            out.write('SESSION_DEADLINE_EPOCH='+str(int(time.time())+20700)+'\n')
+        PY
+    - name: Prepare Telegram log supervisor
+      id: reporting_supervisor
+      run: |
+        python3 - <<'PY'
+        import os, time
+        from pathlib import Path
+        Path(os.environ['RUNNER_TEMP'], 'telegram_logs.py').write_text('"""Stdlib Telegram reporting, usable before application dependencies are installed."""\nimport datetime as dt\nfrom collections import OrderedDict\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport signal\nimport subprocess\nimport sys\nimport threading\nimport time\nimport urllib.request\nimport uuid\n\nfrom crash_reports import EVENT_PREFIX, MAX_DETAILS, exception_details, sanitize\nfrom telegram_api import api_base, CLOUD_API\n\nCHAT_ID = os.getenv(\'REPORT_CHAT_ID\') or \'-1004434678187\'\nINTERVAL_SECONDS = 3600\nMAX_LOG_BYTES = 8 * 1024 * 1024\nMAX_CONTEXT_BYTES = 96 * 1024\nERROR_INTERVAL_SECONDS = 5\nERROR_REPEAT_SECONDS = 300\n\n\ndef timestamp():\n    return dt.datetime.now(dt.timezone.utc).strftime(\'%Y%m%dT%H%M%SZ\')\n\n\ndef run_url():\n    server = os.getenv(\'GITHUB_SERVER_URL\', \'https://github.com\').rstrip(\'/\')\n    repo, run = os.getenv(\'GITHUB_REPOSITORY\', \'\'), os.getenv(\'GITHUB_RUN_ID\', \'\')\n    if re.fullmatch(r\'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\', repo) and run.isascii() and run.isdecimal():\n        return sanitize(f\'{server}/{repo}/actions/runs/{run}\')\n    return \'\'\n\n\ndef warning():\n    print(\'Telegram report upload failed, bot and workflow exit status are preserved\', file=sys.stderr, flush=True)\n\n\ndef send_document(data, filename, caption):\n    if CHAT_ID == \'0\':\n        return True\n    token = os.getenv(\'TELEGRAM_BOT_TOKEN\', \'\').strip()\n    if not token:\n        warning()\n        return False\n    boundary = uuid.uuid4().hex\n    parts = []\n    for name, value in [(\'chat_id\', CHAT_ID), (\'caption\', sanitize(caption))]:\n        parts.append(f\'--{boundary}\\r\\nContent-Disposition: form-data; name="{name}"\\r\\n\\r\\n{value}\\r\\n\'.encode())\n    parts.extend([\n        f\'--{boundary}\\r\\nContent-Disposition: form-data; name="document"; filename="{filename}"\\r\\nContent-Type: text/plain; charset=utf-8\\r\\n\\r\\n\'.encode(),\n        sanitize(data.decode(\'utf-8\', errors=\'replace\')).encode(),\n        f\'\\r\\n--{boundary}--\\r\\n\'.encode(),\n    ])\n    request = urllib.request.Request(\n        f\'{api_base()}/bot{token}/sendDocument\', data=b\'\'.join(parts),\n        headers={\'Content-Type\': f\'multipart/form-data; boundary={boundary}\'}, method=\'POST\')\n    try:\n        # Loopback requests carry the token and must bypass environment proxies.\n        open_request = (urllib.request.build_opener(urllib.request.ProxyHandler({})).open\n                        if api_base() != CLOUD_API else urllib.request.urlopen)\n        with open_request(request, timeout=30) as response:\n            if json.loads(response.read(65536)).get(\'ok\') is not True:\n                raise ValueError(\'Upload rejected\')\n        return True\n    except Exception:\n        # Never print the exception or API response: they can contain credentials\n        warning()\n        return False\n\n\nclass LogBuffer:\n    def __init__(self, limit=None):\n        self.lines = []\n        self.size = 0\n        self.sequence = 0\n        self.truncated = False\n        self.lock = threading.Lock()\n        self.limit = MAX_LOG_BYTES if limit is None else limit\n\n    def append(self, line):\n        data = sanitize(line).encode(\'utf-8\', errors=\'replace\')\n        with self.lock:\n            self.sequence += 1\n            if len(data) > self.limit:\n                data = data[-self.limit:]\n                self.truncated = True\n            self.lines.append((self.sequence, data))\n            self.size += len(data)\n            while self.size > self.limit:\n                self.size -= len(self.lines.pop(0)[1])\n                self.truncated = True\n\n    def snapshot(self):\n        with self.lock:\n            prefix = b\'[Older log entries omitted to keep the file bounded]\\n\' if self.truncated else b\'\'\n            return self.sequence, prefix + b\'\'.join(data for _, data in self.lines)\n\n    def acknowledge(self, sequence):\n        with self.lock:\n            self.lines = [(seq, data) for seq, data in self.lines if seq > sequence]\n            self.size = sum(len(data) for _, data in self.lines)\n            self.truncated = False\n\n\ndef upload_logs(buffer, final=False):\n    sequence, data = buffer.snapshot()\n    if final and not data:\n        return\n    now = timestamp()\n    kind = \'final\' if final else \'hourly\'\n    header = f\'Whisper bot {kind} log, UTC {now}\\n\'\n    data = header.encode() + (data or b\'No bot log entries during this interval\\n\')\n    if send_document(data, f\'bot-log-{kind}-{now}.txt\', f\'Whisper bot {kind} log\'):\n        buffer.acknowledge(sequence)\n\n\ndef parse_issue(line):\n    if not line.startswith(EVENT_PREFIX):\n        return None\n    try:\n        event = json.loads(line[len(EVENT_PREFIX):])\n        if not isinstance(event, dict) or event.get(\'kind\') not in (\'warning\', \'error\', \'crash\'):\n            return None\n        if not isinstance(event.get(\'title\'), str) or not isinstance(event.get(\'details\', \'\'), str):\n            return None\n        return {\'kind\': event[\'kind\'], \'title\': sanitize(event[\'title\'])[:500],\n                \'details\': sanitize(event.get(\'details\', \'\'))[:MAX_DETAILS]}\n    except (ValueError, TypeError, RecursionError):\n        return None\n\n\nclass IssueBuffer:\n    """Bounded error groups, independent of the acknowledged hourly log."""\n    def __init__(self, context):\n        self.context = context\n        self.pending = OrderedDict()\n        self.sent = OrderedDict()\n        self.lock = threading.Lock()\n\n    def append(self, event):\n        key = event[\'kind\'], re.sub(r\'\\bjob \\d+\\b\', \'job <id>\', event[\'title\'], flags=re.I)\n        with self.lock:\n            if key not in self.pending and len(self.pending) >= 40:\n                key = (\'warning\', \'Additional runtime errors\')\n                event = {\'kind\': \'warning\', \'title\': key[1], \'details\': \'\'}\n            previous = self.pending.get(key, {\'count\': 0})\n            self.pending[key] = dict(event, count=previous[\'count\'] + 1)\n\n    def flush(self, final=False):\n        now = time.monotonic()\n        with self.lock:\n            groups = [(key, value.copy()) for key, value in self.pending.items()\n                      if final or key not in self.sent or now-self.sent[key] >= ERROR_REPEAT_SECONDS]\n        if not groups:\n            return\n        tag = \'#error\' if any(value[\'kind\'] == \'error\' for _, value in groups) else \'#warning\'\n        summary = \'\\n\'.join(f"{value[\'title\']} (×{value[\'count\']})" for _, value in groups)\n        # The short caption stays below Telegram\'s 1024 UTF-16-unit limit.\n        caption = tag + \'\\n\\n\' + summary[:300]\n        link = run_url()\n        if link:\n            caption += \'\\n\\nRun: \' + link\n        details = \'\\n\\n\'.join(f"{value[\'title\']}\\nOccurrences: {value[\'count\']}\\n{value[\'details\']}"\n                              for _, value in groups)\n        data = (tag + \'\\nUTC: \' + timestamp() + \'\\nRun: \' + link + \'\\n\\n\' + details).encode()\n        data += b\'\\n\\nRecent bot log\\n\' + self.context.snapshot()[1]\n        if not send_document(data, f\'bot-errors-{timestamp()}.txt\', caption):\n            return\n        with self.lock:\n            for key, value in groups:\n                current = self.pending.get(key)\n                if current is not None:\n                    current[\'count\'] -= value[\'count\']\n                    if current[\'count\'] <= 0:\n                        del self.pending[key]\n                self.sent[key] = now\n                self.sent.move_to_end(key)\n            while len(self.sent) > 200:\n                self.sent.popitem(last=False)\n\n\ndef marker_path():\n    temp = os.getenv(\'RUNNER_TEMP\')\n    return Path(temp)/\'whisper-crash-reported.json\' if temp else None\n\n\ndef crash_reported():\n    path = marker_path()\n    try:\n        marker = json.loads(path.read_text()) if path else {}\n        return bool(marker and marker.get(\'run\') == os.getenv(\'GITHUB_RUN_ID\', \'\')\n                    and marker.get(\'attempt\') == os.getenv(\'GITHUB_RUN_ATTEMPT\', \'\'))\n    except (OSError, ValueError, TypeError):\n        return False\n\n\ndef report_crash(returncode, context, event=None):\n    event = event or {\'title\': \'Bot process stopped unexpectedly\', \'details\': \'\'}\n    title = f"{event[\'title\']}\\nExit code: {returncode}"\n    link = run_url()\n    caption = \'#crash\\n\\n\' + title[:240]\n    if event.get(\'details\'):\n        caption += \'\\n\' + event[\'details\'].splitlines()[0][:120]\n    if link:\n        caption += \'\\n\\nRun: \' + link\n    data = (caption + \'\\nUTC: \' + timestamp() + \'\\n\\n\' + event.get(\'details\', \'\')).encode()\n    data += b\'\\n\\nRecent bot log\\n\' + context.snapshot()[1]\n    if send_document(data, f\'bot-crash-{timestamp()}.txt\', caption):\n        path = marker_path()\n        if path:\n            try:\n                path.write_text(json.dumps({\'run\': os.getenv(\'GITHUB_RUN_ID\', \'\'),\n                                            \'attempt\': os.getenv(\'GITHUB_RUN_ATTEMPT\', \'\')}))\n            except OSError:\n                pass\n        return True\n    return False\n\n\ndef workflow_issues():\n    try:\n        steps = json.loads(os.getenv(\'WORKFLOW_STEPS\', \'{}\'))\n    except ValueError:\n        steps = {}\n    if not isinstance(steps, dict):\n        steps = {}\n    # Do not copy step outputs, they can include credentials or private URLs.\n    return [(name, step.get(\'outcome\')) for name, step in steps.items()\n            if re.fullmatch(r\'[A-Za-z_][A-Za-z0-9_-]{0,79}\', name) and isinstance(step, dict)\n            and step.get(\'outcome\') in (\'failure\', \'cancelled\')][:50]\n\n\ndef report_workflow(data):\n    issues = workflow_issues()\n    status = os.getenv(\'WORKFLOW_STATUS\', \'\')\n    if status not in (\'failure\', \'cancelled\') and not issues:\n        return\n    if issues and all(name == \'session\' for name, _ in issues) and crash_reported():\n        return  # The supervisor already delivered this particular crash.\n    tag = \'#error\' if status == \'failure\' or any(outcome == \'failure\' for _, outcome in issues) else \'#warning\'\n    title = \'Workflow failed\' if tag == \'#error\' else \'Workflow was cancelled\'\n    lines = [tag, \'\', title, *[f\'{name}: {outcome}\' for name, outcome in issues]]\n    if link := run_url():\n        lines.extend([\'\', \'Run: \' + link])\n    caption = \'\\n\'.join([tag, \'\', title, *[f\'{name}: {outcome}\' for name, outcome in issues[:2]]])[:350]\n    if link:\n        caption += \'\\n\\nRun: \' + link\n    document = \'\\n\'.join(lines).encode() + b\'\\n\\n\' + data\n    send_document(document, f\'workflow-error-{timestamp()}.txt\', caption)\n\n\ndef run_bot(script, interval=INTERVAL_SECONDS):\n    buffer = LogBuffer()\n    context = LogBuffer(MAX_CONTEXT_BYTES)\n    issues = IssueBuffer(context)\n    fatal = None\n    returncode = 1\n    stopped = threading.Event()\n    # Ensure the application\'s final event arrives even when stdout is a pipe.\n    try:\n        child = subprocess.Popen([sys.executable, \'-u\', script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n    except Exception as exc:\n        report_crash(1, context, {\'title\': \'Could not start the bot process\', \'details\': exception_details(exc)})\n        return 1\n    previous = {}\n\n    def forward(signum, frame):\n        if child.poll() is None:\n            child.send_signal(signum)\n\n    for signum in (signal.SIGINT, signal.SIGTERM):\n        previous[signum] = signal.signal(signum, forward)\n\n    def periodic():\n        nonlocal fatal\n        next_log = time.monotonic()+interval\n        while not stopped.wait(min(ERROR_INTERVAL_SECONDS, max(0, next_log-time.monotonic()))):\n            if os.getenv(\'BOT_API_PID\',\'\').isdecimal():\n                pid = int(os.environ[\'BOT_API_PID\'])\n                try:\n                    os.kill(pid,0)\n                    stat = Path(f\'/proc/{pid}/stat\')\n                    dead = stat.is_file() and stat.read_text().rsplit(\')\',1)[1].split()[0]==\'Z\'\n                except (OSError,IndexError):\n                    dead = True\n                if dead and child.poll() is None:\n                    fatal = {\'title\':\'Local Bot API server stopped unexpectedly\',\'details\':\'\'}\n                    child.terminate()\n            issues.flush()\n            if time.monotonic() >= next_log:\n                upload_logs(buffer)\n                next_log = time.monotonic()+interval\n\n    reporter = threading.Thread(target=periodic, daemon=True)\n    reporter.start()\n    try:\n        # Bounded reads prevent a single unterminated line from exhausting memory\n        while True:\n            raw = child.stdout.readline(65536)\n            if not raw:\n                break\n            decoded = raw.decode(\'utf-8\', errors=\'replace\')\n            event = parse_issue(decoded)\n            if event:\n                if event[\'kind\'] == \'crash\':\n                    fatal = event\n                else:\n                    issues.append(event)\n                continue\n            line = sanitize(decoded)\n            sys.stdout.write(line)\n            sys.stdout.flush()\n            buffer.append(line)\n            context.append(line)\n        returncode = child.wait()\n    except Exception as exc:\n        fatal = {\'title\': \'Bot supervisor failed\', \'details\': exception_details(exc)}\n        returncode = 1\n    finally:\n        stopped.set()\n        if child.poll() is None:\n            child.terminate()\n            try:\n                child.wait(timeout=10)\n            except subprocess.TimeoutExpired:\n                child.kill()\n                child.wait()\n        child.stdout.close()\n        # The context survives hourly acknowledgement, even for a silent crash.\n        # A slow hourly upload must not delay the crash alert.\n        if returncode != 0 or fatal:\n            failure_code = (returncode if returncode >= 0 else 128-returncode) or 1\n            report_crash(failure_code, context, fatal)\n        reporter.join()  # HTTP uploads have a finite timeout\n        for signum, handler in previous.items():\n            signal.signal(signum, handler)\n        issues.flush(final=True)\n        upload_logs(buffer, final=True)\n    return (returncode if returncode >= 0 else 128 - returncode) or (1 if fatal else 0)\n\n\ndef main():\n    if len(sys.argv) != 3 or sys.argv[1] not in (\'run\', \'diagnostics\'):\n        raise SystemExit(\'Usage: telegram_logs.py run BOT.py | diagnostics FILE.txt\')\n    if sys.argv[1] == \'run\':\n        raise SystemExit(run_bot(sys.argv[2]))\n    try:\n        data = Path(sys.argv[2]).read_bytes()\n    except OSError:\n        warning()\n        data = b\'Diagnostics file was unavailable\\n\'\n    report_workflow(data)\n    send_document(data, \'diagnostics.txt\', \'Whisper bot diagnostics\')\n    if CHAT_ID != \'0\' and os.getenv(\'TELEGRAM_LOCAL_API_REQUIRED\')==\'true\' and api_base()==CLOUD_API:\n        # Early setup reports may temporarily register the cloud endpoint.\n        # Deregister it again before the next local-server attempt.\n        token = os.getenv(\'TELEGRAM_BOT_TOKEN\',\'\').strip()\n        if token:\n            try:\n                request = urllib.request.Request(f\'{CLOUD_API}/bot{token}/logOut\',data=b\'\',method=\'POST\')\n                with urllib.request.urlopen(request,timeout=30) as response:\n                    response.read(65536)\n            except Exception:\n                warning()\n\n\nif __name__ == \'__main__\':\n    main()\n', encoding='utf-8')
+        PY
+    - name: Validate local Telegram API credentials
+      id: api_credentials
+      env:
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      run: |
+        python3 - <<'PYAPICREDENTIALS'
+        import os,re,sys
+        identifier=os.getenv('TELEGRAM_API_ID','').strip()
+        if not identifier.isascii() or not identifier.isdecimal() or not 0<int(identifier)<2**31:
+            sys.exit('Add TELEGRAM_API_ID from my.telegram.org to repository Actions secrets')
+        if not re.fullmatch('[A-Fa-f0-9]{32}',os.getenv('TELEGRAM_API_HASH','').strip()):
+            sys.exit('Add TELEGRAM_API_HASH from my.telegram.org to repository Actions secrets')
+        print('Local Telegram API credentials configured')
+        PYAPICREDENTIALS
+    - name: Check out workflow
+      uses: actions/checkout@main
+      id: checkout
+      with: {}
+    - name: Set up Python
+      uses: actions/setup-python@main
+      id: python
+      with:
+        python-version: '3.x'
+    - name: Restore imported application
+      uses: actions/cache/restore@main
+      id: source_cache
+      if: ${{ inputs.force_reimport != true }}
+      with:
+        path: app
+        key: whisper-source-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          whisper-source-${{ runner.os }}-${{ github.ref_name }}-
+    - name: Import application from ZIP or repository
+      id: source
+      env:
+        APP_ZIP_URL: ${{ secrets.WHISPER_ZIP }}
+        FORCE_REIMPORT: ${{ inputs.force_reimport }}
+      run: |
+        python - <<'PY'
+        import os
+        from pathlib import Path, PurePosixPath
+        import shutil
+        import tempfile
+        import urllib.request
+        import zipfile
+
+        required = ('bot.py','state.py','worker.py','media.py','common.py','transcripts.py','languages.py',
+                    'i18n.py','whisper_i18n.py','backup.py','workflow_tools.py','broadcasts.py','owner_backup.py',
+                    'system_specs.py','dependency_versions.py','dependency_updates.py',
+                    'telegram_logs.py','crash_reports.py','telegram_api.py','local_api.py','requirements.txt')
+        root = Path.cwd()
+        app = root/'app'
+        url = os.getenv('APP_ZIP_URL','').strip()
+        if not url and all((root/name).is_file() for name in required):
+            app = root
+        else:
+            complete = all((app/name).is_file() and not (app/name).is_symlink() for name in required)
+            if os.getenv('FORCE_REIMPORT')=='true' or not complete:
+                if not url.startswith('https://'):
+                    raise SystemExit('Set TELE_ZIP to the direct HTTPS ZIP URL, or commit the complete bot source')
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        archive = Path(td)/'bot.zip'
+                        with urllib.request.urlopen(url,timeout=120) as response,archive.open('wb') as out:
+                            if not response.geturl().startswith('https://'):
+                                raise ValueError('ZIP redirects must use HTTPS')
+                            total = 0
+                            while chunk := response.read(1024*1024):
+                                total += len(chunk)
+                                if total>30_000_000:
+                                    raise ValueError('Source ZIP is too large')
+                                out.write(chunk)
+                        extracted = Path(td)/'extracted'
+                        with zipfile.ZipFile(archive) as z:
+                            entries = z.infolist()
+                            if len(entries)>500 or sum(item.file_size for item in entries)>30_000_000:
+                                raise ValueError('Source ZIP is too large')
+                            for item in entries:
+                                path = PurePosixPath(item.filename)
+                                mode = item.external_attr >> 16
+                                if path.is_absolute() or '..' in path.parts or '\\' in item.filename or (mode & 0o170000)==0o120000:
+                                    raise ValueError('Unsafe ZIP entry')
+                            z.extractall(extracted)
+                        candidates = [p.parent for p in extracted.rglob('bot.py') if (p.parent/'requirements.txt').is_file()]
+                        if len(candidates)!=1:
+                            raise ValueError('The ZIP must contain exactly one bot project')
+                        source = candidates[0]
+                        if not all((source/name).is_file() for name in required):
+                            raise ValueError('The source ZIP is incomplete')
+                        if app.exists():
+                            shutil.rmtree(app)
+                        app.mkdir()
+                        for file in source.iterdir():
+                            if file.is_file() and (file.suffix=='.py' or file.name in ('requirements.txt','README.md')):
+                                shutil.copy2(file,app/file.name)
+                        bundled = source/'.github/workflows/whisper.yml'
+                        if bundled.is_file():
+                            target = app/'.github/workflows/whisper.yml'
+                            target.parent.mkdir(parents=True,exist_ok=True)
+                            shutil.copy2(bundled,target)
+                except Exception as exc:
+                    raise SystemExit('Could not import the source ZIP, '+type(exc).__name__) from None
+        if not all((app/name).is_file() for name in required):
+            raise SystemExit('Required bot files are missing')
+        workflow_ref = os.getenv('GITHUB_WORKFLOW_REF','')
+        if workflow_ref and app!=root:
+            relative = workflow_ref.split('/',2)[2].rsplit('@',1)[0]
+            actual = root/relative
+            if actual.is_file():
+                target = app/'.github/workflows/whisper.yml'
+                target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(actual,target)
+        with open(os.environ['GITHUB_ENV'],'a') as out:
+            out.write('BOT_SOURCE_DIR='+str(app)+'\n')
+        print('Whisper application source is ready')
+        PY
+    - name: Cache pip downloads
+      uses: actions/cache@main
+      with:
+        path: ~/.cache/pip
+        key: whisper-pip-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('app/requirements.txt',
+          'requirements.txt') }}
+        restore-keys: |
+          whisper-pip-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-
+    - name: Install CPU PyTorch and application dependencies
+      id: dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --upgrade -r "$BOT_SOURCE_DIR/requirements.txt"
+        python -m pip check
+        python -c 'import aiogram, whisper, torch; print("aiogram:", aiogram.__version__); print("PyTorch:", torch.__version__)'
+    - name: Restore FFmpeg and neofetch
+      uses: actions/cache/restore@main
+      id: tools_cache
+      with:
+        path: |
+          ~/.ffmpeg
+          ~/.neofetch
+        key: whisper-tools-${{ runner.os }}-${{ runner.arch }}-v1
+    - name: Install and check FFmpeg and neofetch
+      id: tools
+      run: |
+        set -euo pipefail
+        FF_DIR="$HOME/.ffmpeg"
+        mkdir -p "$FF_DIR" "$HOME/.neofetch"
+        if [ ! -x "$FF_DIR/bin/ffmpeg" ] || [ ! -x "$FF_DIR/bin/ffprobe" ]; then
+          archive="$(mktemp "$RUNNER_TEMP/whisper-ffmpeg.XXXXXX.tar.xz")"
+          trap 'rm -f "$archive"' EXIT
+          curl --fail --location --retry 3 --connect-timeout 30 --max-time 300 --output "$archive" https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf "$archive" -C "$FF_DIR" --strip-components=1
+        fi
+        echo "$FF_DIR/bin" >> "$GITHUB_PATH"
+        "$FF_DIR/bin/ffmpeg" -version
+        "$FF_DIR/bin/ffprobe" -version
+        if [ ! -x "$HOME/.neofetch/neofetch" ]; then
+          curl --fail --location --retry 3 --max-time 120 --output "$HOME/.neofetch/neofetch" https://raw.githubusercontent.com/dylanaraps/neofetch/master/neofetch
+          chmod +x "$HOME/.neofetch/neofetch"
+        fi
+        "$HOME/.neofetch/neofetch"
+    - name: Save FFmpeg and neofetch
+      uses: actions/cache/save@main
+      if: ${{ steps.tools_cache.outputs.cache-hit != 'true' }}
+      with:
+        path: |
+          ~/.ffmpeg
+          ~/.neofetch
+        key: ${{ steps.tools_cache.outputs.cache-primary-key }}
+    - name: Restore Whisper models
+      uses: actions/cache/restore@main
+      id: model_cache
+      with:
+        path: models
+        key: whisper-models-${{ runner.os }}-${{ runner.arch }}-v1-${{ inputs.model }}
+        restore-keys: |
+          whisper-models-${{ runner.os }}-${{ runner.arch }}-v1-
+    - name: Check optional R2 configuration
+      id: r2_check
+      run: |
+        python "$BOT_SOURCE_DIR/backup.py" check
+    - name: Resolve official Telegram Bot API source
+      id: api_source
+      run: |
+        set -euo pipefail
+        BOT_API_SOURCE_SHA="$(git ls-remote https://github.com/tdlib/telegram-bot-api.git HEAD | cut -f1)"
+        [[ "$BOT_API_SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+        echo "sha=$BOT_API_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+        python3 - <<'PYAPIPLATFORM'
+        import os,platform
+        release=platform.freedesktop_os_release()
+        with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+            out.write('platform='+release['ID']+'-'+release['VERSION_ID']+'-'+platform.machine()+'\n')
+        PYAPIPLATFORM
+    - name: Restore compiled Telegram Bot API
+      id: api_binary
+      uses: actions/cache/restore@main
+      with:
+        path: ~/.telegram-bot-api
+        key: whisper-api-${{ steps.api_source.outputs.platform }}-${{ steps.api_source.outputs.sha }}-v1
+    - name: Build official Telegram Bot API if missing
+      id: api_build
+      if: ${{ steps.api_binary.outputs.cache-hit != 'true' }}
+      env:
+        BOT_API_SOURCE_SHA: ${{ steps.api_source.outputs.sha }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends clang cmake make gperf libssl-dev zlib1g-dev
+        BOT_API_SOURCE_DIR="$RUNNER_TEMP/telegram-bot-api-source"
+        git init "$BOT_API_SOURCE_DIR"
+        git -C "$BOT_API_SOURCE_DIR" remote add origin https://github.com/tdlib/telegram-bot-api.git
+        git -C "$BOT_API_SOURCE_DIR" fetch --depth 1 origin "$BOT_API_SOURCE_SHA"
+        git -C "$BOT_API_SOURCE_DIR" checkout --detach FETCH_HEAD
+        git -C "$BOT_API_SOURCE_DIR" submodule update --init --recursive --depth 1
+        cmake -S "$BOT_API_SOURCE_DIR" -B "$BOT_API_SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/telegram-bot-api-install"
+        cmake --build "$BOT_API_SOURCE_DIR/build" --target install --parallel 2
+        mkdir -p "$HOME/.telegram-bot-api"
+        install -m 755 "$RUNNER_TEMP/telegram-bot-api-install/bin/telegram-bot-api" "$HOME/.telegram-bot-api/telegram-bot-api"
+    - name: Check compiled Telegram Bot API
+      id: api_binary_check
+      run: '"$HOME/.telegram-bot-api/telegram-bot-api" --version'
+    - name: Save compiled Telegram Bot API
+      id: api_binary_save
+      if: ${{ steps.api_binary.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@main
+      with:
+        path: ~/.telegram-bot-api
+        key: ${{ steps.api_binary.outputs.cache-primary-key }}
+    - name: Restore queue and settings
+      uses: actions/cache/restore@main
+      id: state_cache
+      with:
+        path: |
+          state-cache/state.db
+          state-cache/telegram-api.enc
+        key: whisper-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          whisper-state-${{ runner.os }}-${{ github.ref_name }}-
+    - name: Validate cached state or restore R2 backup
+      id: restore
+      run: |
+        python - <<'PY'
+        from pathlib import Path
+        import shutil
+        Path('state').mkdir(exist_ok=True)
+        for name in ('state.db','telegram-api.enc'):
+            source = Path('state-cache')/name
+            if source.is_file():
+                shutil.copy2(source,Path('state')/name)
+        PY
+        python "$BOT_SOURCE_DIR/backup.py" restore
+    - name: Start local Telegram Bot API
+      id: local_api_start
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.WHISPER_BOT_TOKEN }}
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      run: python "$BOT_SOURCE_DIR/local_api.py" start
+    - name: Run Whisper Telegram bot
+      id: session
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.WHISPER_BOT_TOKEN }}
+        OWNER_ID: ${{ secrets.TELE_OWNER_ID || secrets.OWNER_ID || vars.TELE_OWNER_ID }}
+      run: |
+        python "$RUNNER_TEMP/telegram_logs.py" run "$BOT_SOURCE_DIR/bot.py"
+        python "$BOT_SOURCE_DIR/backup.py" receipt
+    - name: Checkpoint encrypted local API state
+      id: local_api_checkpoint
+      if: ${{ always() && steps.local_api_start.outcome == 'success' }}
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.WHISPER_BOT_TOKEN }}
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      run: python "$BOT_SOURCE_DIR/local_api.py" checkpoint
+    - name: Create consistent queue snapshot
+      id: snapshot
+      if: ${{ always() && steps.restore.outcome == 'success' && (steps.local_api_start.outcome != 'success' || steps.local_api_checkpoint.outcome
+        == 'success') }}
+      run: |
+        python - <<'PY'
+        import os, shutil, sqlite3
+        from contextlib import closing
+        from pathlib import Path
+        data = Path(os.environ['BOT_DATA_DIR'])
+        source = data/'state.db'
+        if source.is_file():
+            target = Path('state-cache/state.db')
+            target.parent.mkdir(exist_ok=True)
+            temporary = target.with_suffix('.tmp')
+            temporary.unlink(missing_ok=True)
+            with closing(sqlite3.connect(source)) as src,closing(sqlite3.connect(temporary)) as dst:
+                src.backup(dst)
+                if dst.execute('PRAGMA quick_check').fetchone()[0]!='ok':
+                    raise RuntimeError('Queue snapshot is invalid')
+                required = dst.execute('SELECT value FROM meta WHERE key=?',
+                                      ('local_api_state_required',)).fetchone() == ('1',)
+            encrypted = data/'telegram-api.enc'
+            if required and not encrypted.is_file():
+                raise RuntimeError('The queue requires its matching encrypted local Bot API state')
+            if encrypted.is_file():
+                shutil.copy2(encrypted,target.parent/encrypted.name)
+            else:
+                (target.parent/'telegram-api.enc').unlink(missing_ok=True)
+            temporary.replace(target)
+            with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+                out.write('ready=true\n')
+        PY
+    - name: Back up state and source to R2
+      id: r2_backup
+      if: ${{ always() && steps.snapshot.outputs.ready == 'true' }}
+      run: |
+        python "$BOT_SOURCE_DIR/backup.py" backup
+    - name: Save queue and settings
+      uses: actions/cache/save@main
+      id: state_save
+      if: ${{ always() && steps.snapshot.outputs.ready == 'true' }}
+      with:
+        path: |
+          state-cache/state.db
+          state-cache/telegram-api.enc
+        key: whisper-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Save imported application
+      uses: actions/cache/save@main
+      id: source_save
+      if: ${{ always() && steps.source.outcome == 'success' && env.BOT_SOURCE_DIR != github.workspace }}
+      with:
+        path: app
+        key: whisper-source-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Save downloaded Whisper models
+      uses: actions/cache/save@main
+      if: ${{ always() && hashFiles('models/*.pt') != '' }}
+      with:
+        path: models
+        key: whisper-models-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('models/*.pt') }}
+    - name: Verify saved queue caches and prune old copies
+      id: prune
+      env:
+        GH_TOKEN: ${{ github.token }}
+      if: ${{ success() && steps.session.outputs.ok == 'true' }}
+      run: |
+        python "$BOT_SOURCE_DIR/workflow_tools.py" prune
+    - name: Start the next session
+      id: next
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CONTINUE_SESSIONS: ${{ inputs.continue }}
+      if: ${{ success() && steps.session.outputs.ok == 'true' && steps.session.outputs.reason != 'shutdown' && (inputs.continue
+        || steps.session.outputs.reason == 'restart') }}
+      run: |
+        python "$BOT_SOURCE_DIR/workflow_tools.py" dispatch
+    - name: Ensure local API for final reports
+      id: local_api_reports
+      if: ${{ always() && steps.local_api_start.outcome == 'success' }}
+      continue-on-error: true
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.WHISPER_BOT_TOKEN }}
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      run: python "$BOT_SOURCE_DIR/local_api.py" ensure
+    - name: Write sanitized diagnostics
+      id: diagnostics
+      if: ${{ always() }}
+      env:
+        WORKFLOW_STATUS: ${{ job.status }}
+        SESSION_REASON: ${{ steps.session.outputs.reason }}
+      run: |
+        python - <<'PY'
+        import importlib.metadata, os
+        from pathlib import Path
+        lines = ['Whisper bot diagnostics','Workflow status: '+os.getenv('WORKFLOW_STATUS',''),
+                 'Stop reason: '+os.getenv('SESSION_REASON','')]
+        for name in ('aiogram','openai-whisper','torch','boto3'):
+            try:
+                lines.append(name+': '+importlib.metadata.version(name))
+            except importlib.metadata.PackageNotFoundError:
+                lines.append(name+': not installed')
+        Path('diagnostics.txt').write_text('\n'.join(lines)+'\n')
+        PY
+    - name: Report workflow diagnostics to Telegram
+      id: report
+      if: ${{ always() }}
+      continue-on-error: true
+      env:
+        WORKFLOW_STATUS: ${{ job.status }}
+        WORKFLOW_STEPS: ${{ toJSON(steps) }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.WHISPER_BOT_TOKEN }}
+      run: |
+        python3 "$RUNNER_TEMP/telegram_logs.py" diagnostics diagnostics.txt
+    - name: Stop local Telegram Bot API
+      id: local_api_stop
+      if: ${{ always() && steps.local_api_start.outcome == 'success' }}
+      continue-on-error: true
+      run: python "$BOT_SOURCE_DIR/local_api.py" stop
