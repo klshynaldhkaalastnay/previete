@@ -1,4 +1,4 @@
-name: Archive Video to IA
+name: Archive to IA
 run-name: "Archive: ${{ inputs.url }}"
 
 on:
