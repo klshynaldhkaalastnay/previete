@@ -39,15 +39,14 @@ jobs:
       with:
         python-version: '3.x'
 
-    - name: Cache pip, yt-dlp, FFmpeg, and IA Config
+    - name: Cache pip, FFmpeg, and IA Config
       uses: actions/cache@main
       with:
         path: |
           ~/.cache/pip
-          ~/.cache/yt-dlp
           ~/.ffmpeg
           ~/.config/internetarchive
-        key: ${{ runner.os }}-archive-cache-${{ hashFiles('.github/workflows/tubeup.yml') }}
+        key: ${{ runner.os }}-archive-cache-${{ hashFiles('.github/workflows/galup.yml') }}
         restore-keys: |
           ${{ runner.os }}-archive-cache-
 
