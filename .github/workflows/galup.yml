@@ -77,7 +77,7 @@ jobs:
     - name: Install galup and IA CLI
       run: |
         python -m pip install --upgrade pip
-        pip install galup gallery-dl internetarchive
+        pip install git+https://github.com/goodvids56/galup gallery-dl internetarchive
 
     - name: Configure IA CLI
       env:
