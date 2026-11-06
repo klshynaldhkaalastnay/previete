@@ -403,6 +403,7 @@ jobs:
               async def load_state():
                   nonlocal initialized
                   restored_retries = {}
+                  snapshot = None
                   # Refuse to silently replace a malformed state file with empty state
                   if state.exists():
                       snapshot = json.loads(state.read_text(encoding="utf-8"))
@@ -425,9 +426,37 @@ jobs:
                               raise RuntimeError("Invalid delayed retry deadline or job data")
                           restored_retries[retry_id] = record
                   await load_original()
-                  if state.exists():
-                      # This bot removes the state file only after a successful load
-                      raise RuntimeError("The bot could not restore bot_state.json, keeping the prior cache")
+                  if snapshot is not None and state.exists():
+                      # Newer bots keep the checkpoint after loading. Verify the
+                      # restored work instead of treating its presence as failure.
+                      expected_pending = snapshot.get("pending_traces", {})
+                      actual_pending = getattr(client, "pending_traces", {})
+                      if set(actual_pending) != set(expected_pending) or any(
+                          (actual_pending[trace].get("user_id"), actual_pending[trace].get("target_url"))
+                          != (context.get("user_id"), context.get("target_url"))
+                          for trace, context in expected_pending.items()
+                      ):
+                          raise RuntimeError("The bot could not restore pending requests, keeping the prior cache")
+                      expected_queues = {
+                          int(user): [(job["user_id"], job["target_url"]) for job in jobs]
+                          for user, jobs in snapshot.get("queued_jobs", {}).items() if jobs
+                      }
+                      actual_queues = {
+                          int(user): [(job[5], job[0]) for job in jobs]
+                          for user, jobs in client.queued_jobs.items() if jobs
+                      }
+                      if actual_queues != expected_queues:
+                          raise RuntimeError("The bot could not restore queued requests, keeping the prior cache")
+                      expected_batches = snapshot.get("batch_jobs", {})
+                      actual_batches = getattr(client, "batch_jobs", {})
+                      if set(actual_batches) != set(expected_batches) or any(
+                          any(actual_batches[batch].get(field) != data.get(field) for field in (
+                              "total", "completed", "success", "failed", "archive_urls"
+                          )) for batch, data in expected_batches.items()
+                      ):
+                          raise RuntimeError("The bot could not restore archive batches, keeping the prior cache")
+                      if getattr(client, "bot_trace_counter", 0) < snapshot.get("bot_trace_counter", 0):
+                          raise RuntimeError("The bot could not restore its trace counter, keeping the prior cache")
                   initialized = True
                   delayed_retries.update(restored_retries)
                   for retry_id in restored_retries:
@@ -464,6 +493,9 @@ jobs:
               async def flush_and_close():
                   nonlocal closing
                   closing = True
+                  # Stop the new queue dispatcher before cancelling pollers; a
+                  # poller's finally block must not launch work during shutdown.
+                  client.shutdown_requested = True
                   try:
                       if initialized:
                           loops = [namespace.get(name) for name in (
@@ -479,7 +511,9 @@ jobs:
                                       pending.append(task)
                           if pending:
                               await asyncio.gather(*pending, return_exceptions=True)
-                          waiting_tasks = [task for task in retry_tasks if task is not asyncio.current_task()]
+                          waiting_tasks = [task for task in (
+                              retry_tasks | set(getattr(client, "dispatch_tasks", ()))
+                          ) if task is not asyncio.current_task()]
                           for task in waiting_tasks:
                               task.cancel()
                           if waiting_tasks:
@@ -541,7 +575,7 @@ jobs:
           exec(compile(tree, str(script), "exec"), module.__dict__)
           PY
 
-      - name: Run YouTube Archive Bot for up to 5 hours 30 minutes
+      - name: Run YouTube Archive Bot session
         id: run
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
@@ -584,7 +618,8 @@ jobs:
               [sys.executable, "-u", str(Path(os.environ["RUNNER_TEMP"]) / "yt-workflow-launcher.py"), str(script)], cwd=app,
               stdin=subprocess.DEVNULL, start_new_session=True
           )
-          deadline = time.monotonic() + int(os.environ["SESSION_SECONDS"])
+          session_seconds = int(os.environ["SESSION_SECONDS"])
+          deadline = time.monotonic() + session_seconds
           reason = "script-exited"
           forced = False
           upload_requested = False
@@ -596,7 +631,9 @@ jobs:
               except ProcessLookupError:
                   pass
 
-          print("YouTube Archive Bot session started, maximum duration is 5:30:00", flush=True)
+          hours, remainder = divmod(session_seconds, 3600)
+          minutes, seconds = divmod(remainder, 60)
+          print(f"YouTube Archive Bot session started, maximum duration is {hours}:{minutes:02d}:{seconds:02d}", flush=True)
           try:
               while True:
                   if cancelled:
