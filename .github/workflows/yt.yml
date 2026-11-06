@@ -295,6 +295,7 @@ jobs:
               delayed_retries = {}
               retry_messages = {}
               retry_tasks = set()
+              retry_tasks_by_id = {}
 
               def track_task(task):
                   retry_tasks.add(task)
@@ -321,6 +322,7 @@ jobs:
               async def run_delayed_retry(retry_id):
                   task = asyncio.current_task()
                   retry_tasks.add(task)
+                  retry_tasks_by_id[retry_id] = task
                   try:
                       if closing:
                           return
@@ -371,6 +373,26 @@ jobs:
                       logging.exception("Delayed retry could not resume, any waiting record is retained")
                   finally:
                       retry_tasks.discard(task)
+                      if retry_tasks_by_id.get(retry_id) is task:
+                          retry_tasks_by_id.pop(retry_id, None)
+
+              async def cancel_workflow_retries(user_id=None):
+                  tasks_to_stop = []
+                  removed = []
+                  async with save_lock:
+                      for retry_id, record in list(delayed_retries.items()):
+                          if user_id is None or record["job"]["user_id"] == user_id:
+                              removed.append(delayed_retries.pop(retry_id))
+                              retry_messages.pop(retry_id, None)
+                              task = retry_tasks_by_id.get(retry_id)
+                              if task is not None and task is not asyncio.current_task():
+                                  task.cancel()
+                                  tasks_to_stop.append(task)
+                  if tasks_to_stop:
+                      await asyncio.gather(*tasks_to_stop, return_exceptions=True)
+                  return {"removed": len(removed), "batch_ids": [
+                      record["job"]["batch_id"] for record in removed if record["job"].get("batch_id")
+                  ]}
 
               def schedule_timeout_retry(context):
                   # Register synchronously, before create_task() starts the coroutine
@@ -544,6 +566,7 @@ jobs:
               client.save_state = save_state
               client.close = close
               namespace["schedule_timeout_retry"] = schedule_timeout_retry
+              client._workflow_cancel_retries = cancel_workflow_retries
               client._workflow_hooks_installed = True
               return client
 
