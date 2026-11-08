@@ -1,0 +1,914 @@
+name: Arab News Archive Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      continue:
+        description: "Start another session after a successful run"
+        required: true
+        default: true
+        type: boolean
+      force_reimport:
+        description: "Ignore the Arab News Archive cache and import fresh files"
+        required: true
+        default: false
+        type: boolean
+      update_python_file:
+        description: "Download and replace the bot script from ARAB_NEWS_PYTHON_FILE_URL"
+        required: true
+        default: false
+        type: boolean
+      python_file:
+        description: "Python file relative to the project root"
+        required: true
+        default: "arab_news_archive_bot.py"
+        type: string
+      python_version:
+        description: "Python version"
+        required: true
+        default: "3.12"
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: arab-news-archive-bot
+  cancel-in-progress: false
+
+env:
+  SESSION_SECONDS: "20400"
+  PYTHON_FILE: ${{ inputs.python_file }}
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout bot repository
+        uses: actions/checkout@main
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@main
+        with:
+          python-version: ${{ inputs.python_version }}
+          check-latest: true
+
+      - name: Install Linux tools
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq ca-certificates
+
+      - name: Validate bot settings
+        env:
+          ARAB_NEWS_DISCORD_TOKEN: ${{ secrets.ARAB_NEWS_DISCORD_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID || vars.OWNER_ID }}
+          ARCHIVE_OWNER: ${{ secrets.ARCHIVE_OWNER || vars.ARCHIVE_OWNER }}
+          ARCHIVE_REPO: ${{ secrets.ARCHIVE_REPO || vars.ARCHIVE_REPO }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import os
+          import re
+          if not os.environ.get("ARAB_NEWS_DISCORD_TOKEN", "").strip():
+              raise SystemExit("Add the ARAB_NEWS_DISCORD_TOKEN repository secret")
+          owner_id = os.environ.get("OWNER_ID", "").strip()
+          if not owner_id.isdigit() or int(owner_id) <= 0:
+              raise SystemExit("Set OWNER_ID to your numeric Discord user ID (a secret or variable)")
+          owner = os.environ["ARCHIVE_OWNER"].strip()
+          repo = os.environ.get("ARCHIVE_REPO", "").strip()
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repo):
+              raise SystemExit("Set ARCHIVE_OWNER and ARCHIVE_REPO to the other account's owner/repository names, not URLs")
+          if not os.environ.get("GH_PAT", "").strip():
+              raise SystemExit("Add GH_PAT with Actions read/write access to the archive repository")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"ARCHIVE_TARGET_OWNER={owner}\n")
+              output.write(f"ARCHIVE_TARGET_REPO={repo}\n")
+          print("Bot configuration is present")
+          PY
+
+      - name: Restore application files and data
+        if: inputs.force_reimport != true
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            arab-news-archive-app
+            !arab-news-archive-app/.env
+            !arab-news-archive-app/.env.*
+            !arab-news-archive-app/.venv
+            !arab-news-archive-app/venv
+            !arab-news-archive-app/**/__pycache__
+          key: arab-news-bot-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            arab-news-bot-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Prepare the Arab News Archive bot files
+        env:
+          FORCE_REIMPORT: ${{ inputs.force_reimport }}
+          ARAB_NEWS_APP_ZIP_URL: ${{ secrets.ARAB_NEWS_APP_ZIP_URL }}
+          ARAB_NEWS_APP_ZIP_FOLDER: ${{ secrets.ARAB_NEWS_APP_ZIP_FOLDER || vars.ARAB_NEWS_APP_ZIP_FOLDER }}
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          from hashlib import sha256
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import subprocess
+          import tempfile
+          import zipfile
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          app = workspace / "arab-news-archive-app"
+          entry = PurePosixPath(os.environ["PYTHON_FILE"].replace("\\", "/"))
+          if entry.is_absolute() or ".." in entry.parts or entry.suffix != ".py":
+              raise SystemExit("python_file must be a relative .py path inside the project")
+          if os.environ["FORCE_REIMPORT"] == "true" and app.exists():
+              shutil.rmtree(app)
+          app.mkdir(parents=True, exist_ok=True)
+          zip_url = os.environ.get("ARAB_NEWS_APP_ZIP_URL", "").strip()
+
+          if zip_url and not (app / entry).is_file():
+              folder = PurePosixPath(os.environ.get("ARAB_NEWS_APP_ZIP_FOLDER", "").replace("\\", "/"))
+              if folder.is_absolute() or ".." in folder.parts:
+                  raise SystemExit("ARAB_NEWS_APP_ZIP_FOLDER must be a relative folder inside the ZIP")
+              with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temp:
+                  temp = Path(temp)
+                  archive = temp / "project.zip"
+                  print("Downloading Python project ZIP", flush=True)
+                  subprocess.run([
+                      "curl", "--fail", "--location", "--silent", "--show-error",
+                      "--retry", "5", "--retry-delay", "5", "--connect-timeout", "30",
+                      "--max-time", "600", zip_url, "--output", str(archive)
+                  ], check=True)
+                  extracted = temp / "extracted"
+                  extracted.mkdir()
+                  with zipfile.ZipFile(archive) as zf:
+                      for member in zf.infolist():
+                          path = PurePosixPath(member.filename.replace("\\", "/"))
+                          if path.is_absolute() or ".." in path.parts:
+                              raise SystemExit("ZIP contains an unsafe path")
+                          mode = member.external_attr >> 16
+                          if stat.S_ISLNK(mode):
+                              raise SystemExit("ZIP symlinks are not supported")
+                          target = extracted.joinpath(*path.parts)
+                          if member.is_dir():
+                              target.mkdir(parents=True, exist_ok=True)
+                          else:
+                              target.parent.mkdir(parents=True, exist_ok=True)
+                              with zf.open(member) as src, target.open("wb") as dst:
+                                  shutil.copyfileobj(src, dst)
+                              if mode & 0o111:
+                                  target.chmod(0o755)
+                  source = extracted.joinpath(*folder.parts)
+                  if not source.is_dir() or not (source / entry).is_file():
+                      raise SystemExit("Python file not found in ZIP, check python_file and ARAB_NEWS_APP_ZIP_FOLDER")
+                  shutil.rmtree(app)
+                  shutil.copytree(source, app)
+          script = (app / entry).resolve()
+          if not script.is_relative_to(app.resolve()):
+              raise SystemExit("Bot script must be inside the Arab News Archive app directory")
+          if not zip_url:
+              repository_script = (workspace / entry).resolve()
+              if (
+                  not repository_script.is_relative_to(workspace)
+                  or repository_script.is_relative_to(app.resolve())
+                  or not repository_script.is_file()
+              ):
+                  raise SystemExit(f"Add {entry.as_posix()} to the bot repository or set ARAB_NEWS_APP_ZIP_URL")
+              source = repository_script.read_bytes()
+              digest = sha256(source).hexdigest()
+              stamp = app / ".repository-script.sha256"
+              previous_digest = stamp.read_text(encoding="ascii").strip() if stamp.is_file() else None
+              if not script.is_file() or previous_digest != digest:
+                  compile(source, str(repository_script), "exec")
+                  script.parent.mkdir(parents=True, exist_ok=True)
+                  script.write_bytes(source)
+                  stamp.write_text(digest + "\n", encoding="ascii")
+          if not script.is_file():
+              raise SystemExit("Bot script was not found")
+          print("Bot files and data are ready")
+          PY
+
+      - name: Update only the bot Python file
+        if: inputs.update_python_file == true
+        env:
+          ARAB_NEWS_PYTHON_FILE_URL: ${{ secrets.ARAB_NEWS_PYTHON_FILE_URL }}
+        run: |
+          set -Eeuo pipefail
+          python - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          from urllib.parse import urlsplit
+
+          url = os.environ.get("ARAB_NEWS_PYTHON_FILE_URL", "").strip()
+          if not url:
+              raise SystemExit("Set ARAB_NEWS_PYTHON_FILE_URL before enabling update_python_file")
+          if urlsplit(url).scheme not in ("https", "http"):
+              raise SystemExit("ARAB_NEWS_PYTHON_FILE_URL must be a direct HTTP or HTTPS download URL")
+
+          app = (Path(os.environ["GITHUB_WORKSPACE"]) / "arab-news-archive-app").resolve()
+          script = (app / os.environ["PYTHON_FILE"]).resolve()
+          if not script.is_relative_to(app) or script.suffix != ".py" or not script.is_file():
+              raise SystemExit("Python update target must be an existing .py file inside app")
+
+          # Stage beside the target so replacement is atomic and data stays intact
+          fd, staged_name = tempfile.mkstemp(prefix=".python-update-", suffix=".py", dir=script.parent)
+          os.close(fd)
+          staged = Path(staged_name)
+          try:
+              result = subprocess.run([
+                  "curl", "--fail", "--location", "--silent", "--show-error",
+                  "--proto", "=http,https", "--proto-redir", "=http,https",
+                  "--retry", "3", "--retry-delay", "5", "--connect-timeout", "30",
+                  "--max-time", "120", url, "--output", str(staged)
+              ], capture_output=True)
+              if result.returncode != 0:
+                  raise SystemExit("Python file download failed, the previous script and saved data were kept")
+              source = staged.read_bytes()
+              if not source.strip():
+                  raise SystemExit("Downloaded Python file is empty, the previous script was kept")
+              try:
+                  compile(source, str(script), "exec")
+              except (SyntaxError, ValueError):
+                  raise SystemExit("Downloaded file is not valid Python, the previous script was kept") from None
+              staged.chmod(script.stat().st_mode & 0o777)
+              os.replace(staged, script)
+              print("Updated the bot Python file, saved data was preserved")
+          finally:
+              staged.unlink(missing_ok=True)
+          PYTHON
+
+      - name: Install the bot's Python dependencies
+        run: |
+          set -Eeuo pipefail
+          python -m venv "$RUNNER_TEMP/arab-news-bot-venv"
+          BOT_PYTHON="$RUNNER_TEMP/arab-news-bot-venv/bin/python"
+          "$BOT_PYTHON" -m pip install --upgrade pip
+          "$BOT_PYTHON" -m pip install \
+            "discord.py>=2.3,<3" "aiohttp>=3.9,<4" "aiosqlite>=0.19,<1" \
+            "aiofiles>=23,<26" "python-dotenv>=1,<2" "internetarchive>=5,<6"
+          "$BOT_PYTHON" -m pip check
+
+      - name: Check R2 backup configuration
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for config_name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET_NAME; do
+            if [ -z "${!config_name}" ]; then
+              echo "::error::Set $config_name before starting the bot, every successful session now requires an R2 backup"
+              exit 1
+            fi
+          done
+
+      - name: Build the bot shutdown launcher
+        run: |
+          cat > "$RUNNER_TEMP/arab-news-workflow-launcher.py" <<'PY'
+          import ast
+          import asyncio
+          import hashlib
+          import json
+          import logging
+          import math
+          import os
+          from pathlib import Path
+          import sys
+          import time
+          import types
+          import uuid
+
+
+          def install_workflow_hooks(client):
+              if getattr(client, "_workflow_hooks_installed", False):
+                  return client
+              # The uploaded bot saves state in /restart, but not in close(), install
+              # the same save operation for timed shutdowns without editing its source
+              save_original = client.save_state
+              load_original = client.load_state
+              close_original = client.close
+              namespace = save_original.__func__.__globals__
+              state = Path(namespace["STATE_FILE"]).resolve()
+              receipt = Path(os.environ["WORKFLOW_STATE_RECEIPT"])
+              receipt.unlink(missing_ok=True)
+              initialized = False
+              close_done = None
+              closing = False
+              save_lock = asyncio.Lock()
+              required = {"pending_traces", "queued_jobs", "active_jobs", "batch_jobs"}
+              delayed_retries = {}
+              retry_messages = {}
+              retry_tasks = set()
+              retry_tasks_by_id = {}
+
+              def track_task(task):
+                  retry_tasks.add(task)
+                  task.add_done_callback(retry_tasks.discard)
+                  return task
+
+              async def resume_queues():
+                  if closing:
+                      return
+                  await client.wait_until_ready()
+                  for user_id in list(client.queued_jobs):
+                      while (not closing and client.queued_jobs[user_id]
+                             and client.active_jobs[user_id] < namespace["MAX_CONCURRENT_JOBS"]):
+                          async with save_lock:
+                              if closing:
+                                  return
+                              queued_before = len(client.queued_jobs[user_id])
+                              await namespace["check_and_process_queue"](user_id)
+                              if len(client.queued_jobs[user_id]) >= queued_before:
+                                  break
+
+              async def run_delayed_retry(retry_id):
+                  task = asyncio.current_task()
+                  retry_tasks.add(task)
+                  retry_tasks_by_id[retry_id] = task
+                  try:
+                      if closing:
+                          return
+                      await client.wait_until_ready()
+                      record = delayed_retries.get(retry_id)
+                      if record is None:
+                          return
+                      # UTC timestamps retain elapsed offline time, never restart a
+                      # two-hour wait merely because the bot or workflow restarted
+                      while record["due_at"] > time.time():
+                          await asyncio.sleep(min(record["due_at"] - time.time(), 60))
+                      if closing:
+                          return
+                      job = record["job"]
+                      message = retry_messages.get(retry_id)
+                      if message is None and job.get("message_data"):
+                          details = job["message_data"]
+                          try:
+                              channel = client.get_channel(details["channel_id"])
+                              if channel is None:
+                                  channel = await client.fetch_channel(details["channel_id"])
+                              if channel is not None:
+                                  message = await channel.fetch_message(details["message_id"])
+                          except Exception as error:
+                              logging.warning("Could not restore delayed retry's status message: %s", error)
+                      user_id = job["user_id"]
+                      async with save_lock:
+                          if closing or retry_id not in delayed_retries:
+                              return
+                          queued_job = (
+                              job["target_url"], job["url_type"], job["is_silent"], message,
+                              job.get("guild_id"), user_id, job.get("free_space", False),
+                              job.get("batch_id"), job.get("is_bot_request", False),
+                              True,  # Reuse the saved status message
+                              job.get("ignore_existing_item", True)
+                          )
+                          client.queued_jobs[user_id].append(queued_job)
+                          # Queue insertion and timer removal are one snapshot change,
+                          # so a restart cannot restore this as both queued and waiting
+                          delayed_retries.pop(retry_id)
+                          retry_messages.pop(retry_id, None)
+                          if client.active_jobs[user_id] < namespace["MAX_CONCURRENT_JOBS"]:
+                              await namespace["check_and_process_queue"](user_id)
+                  except asyncio.CancelledError:
+                      # Shutdown cancels the sleep, its saved record remains intact
+                      raise
+                  except Exception:
+                      logging.exception("Delayed retry could not resume, any waiting record is retained")
+                  finally:
+                      retry_tasks.discard(task)
+                      if retry_tasks_by_id.get(retry_id) is task:
+                          retry_tasks_by_id.pop(retry_id, None)
+
+              async def cancel_workflow_retries(user_id=None):
+                  tasks_to_stop = []
+                  removed = []
+                  async with save_lock:
+                      for retry_id, record in list(delayed_retries.items()):
+                          if user_id is None or record["job"]["user_id"] == user_id:
+                              removed.append(delayed_retries.pop(retry_id))
+                              retry_messages.pop(retry_id, None)
+                              task = retry_tasks_by_id.get(retry_id)
+                              if task is not None and task is not asyncio.current_task():
+                                  task.cancel()
+                                  tasks_to_stop.append(task)
+                  if tasks_to_stop:
+                      await asyncio.gather(*tasks_to_stop, return_exceptions=True)
+                  return {"removed": len(removed), "batch_ids": [
+                      record["job"]["batch_id"] for record in removed if record["job"].get("batch_id")
+                  ]}
+
+              def schedule_timeout_retry(context):
+                  # Register synchronously, before create_task() starts the coroutine
+                  # This also covers a shutdown immediately after the timer is scheduled
+                  retry_id = uuid.uuid4().hex
+                  message = context.get("status_msg")
+                  delayed_retries[retry_id] = {
+                      "id": retry_id,
+                      "due_at": time.time() + namespace["JOB_RETRY_DELAY_SECONDS"],
+                      "job": {
+                          "user_id": context["user_id"],
+                          "target_url": context["target_url"],
+                          "url_type": context["url_type"],
+                          "is_silent": context["is_silent"],
+                          "guild_id": context.get("guild_id"),
+                          "free_space": context.get("free_space", False),
+                          "batch_id": context.get("batch_id"),
+                          "is_bot_request": context.get("is_bot_request", False),
+                          "ignore_existing_item": True,
+                          "message_data": {
+                              "channel_id": message.channel.id, "message_id": message.id
+                          } if message else None
+                      }
+                  }
+                  if message is not None:
+                      retry_messages[retry_id] = message
+                  return run_delayed_retry(retry_id)
+
+              async def load_state():
+                  nonlocal initialized
+                  restored_retries = {}
+                  snapshot = None
+                  # Refuse to silently replace a malformed state file with empty state
+                  if state.exists():
+                      snapshot = json.loads(state.read_text(encoding="utf-8"))
+                      if not isinstance(snapshot, dict) or any(
+                          key in snapshot and not isinstance(snapshot[key], dict) for key in required
+                      ):
+                          raise RuntimeError("arab_news_bot_state.json does not contain the expected bot state")
+                      records = snapshot.get("workflow_delayed_retries", [])
+                      if not isinstance(records, list):
+                          raise RuntimeError("Invalid saved delayed retries, keeping the previous state")
+                      for record in records:
+                          if not isinstance(record, dict):
+                              raise RuntimeError("Invalid delayed retry record")
+                          retry_id, due_at, job = record.get("id"), record.get("due_at"), record.get("job")
+                          if (not isinstance(retry_id, str) or not retry_id or retry_id in restored_retries
+                              or not isinstance(due_at, (int, float)) or not math.isfinite(due_at)
+                              or not isinstance(job, dict)
+                              or not {"user_id", "target_url", "url_type", "is_silent"}.issubset(job)
+                              or not isinstance(job["user_id"], int)):
+                              raise RuntimeError("Invalid delayed retry deadline or job data")
+                          restored_retries[retry_id] = record
+                  await load_original()
+                  if snapshot is not None and state.exists():
+                      # Newer bots keep the checkpoint after loading. Verify the
+                      # restored work instead of treating its presence as failure.
+                      expected_pending = snapshot.get("pending_traces", {})
+                      actual_pending = getattr(client, "pending_traces", {})
+                      if set(actual_pending) != set(expected_pending) or any(
+                          (actual_pending[trace].get("user_id"), actual_pending[trace].get("target_url"))
+                          != (context.get("user_id"), context.get("target_url"))
+                          for trace, context in expected_pending.items()
+                      ):
+                          raise RuntimeError("The bot could not restore pending requests, keeping the prior cache")
+                      expected_queues = {
+                          int(user): [(job["user_id"], job["target_url"]) for job in jobs]
+                          for user, jobs in snapshot.get("queued_jobs", {}).items() if jobs
+                      }
+                      actual_queues = {
+                          int(user): [(job[5], job[0]) for job in jobs]
+                          for user, jobs in client.queued_jobs.items() if jobs
+                      }
+                      if actual_queues != expected_queues:
+                          raise RuntimeError("The bot could not restore queued requests, keeping the prior cache")
+                      expected_batches = snapshot.get("batch_jobs", {})
+                      actual_batches = getattr(client, "batch_jobs", {})
+                      if set(actual_batches) != set(expected_batches) or any(
+                          any(actual_batches[batch].get(field) != data.get(field) for field in (
+                              "total", "completed", "success", "failed", "archive_urls"
+                          )) for batch, data in expected_batches.items()
+                      ):
+                          raise RuntimeError("The bot could not restore archive batches, keeping the prior cache")
+                      if getattr(client, "bot_trace_counter", 0) < snapshot.get("bot_trace_counter", 0):
+                          raise RuntimeError("The bot could not restore its trace counter, keeping the prior cache")
+                  initialized = True
+                  delayed_retries.update(restored_retries)
+                  for retry_id in restored_retries:
+                      track_task(asyncio.create_task(run_delayed_retry(retry_id)))
+                  if getattr(client, "queued_jobs", None):
+                      track_task(asyncio.create_task(resume_queues()))
+                  if restored_retries:
+                      logging.info("Restored %s delayed retries with their original deadlines", len(restored_retries))
+
+              async def save_state():
+                  async with save_lock:
+                      retry_snapshot = list(delayed_retries.values())
+                      temporary = state.with_name(state.name + ".workflow-tmp")
+                      temporary.unlink(missing_ok=True)
+                      original_path = namespace["STATE_FILE"]
+                      try:
+                          namespace["STATE_FILE"] = str(temporary)
+                          await save_original()
+                          # The original method logs write errors instead of raising
+                          # Verify a fresh snapshot before replacing the previous one
+                          raw = temporary.read_bytes()
+                          snapshot = json.loads(raw)
+                          if not isinstance(snapshot, dict) or not required.issubset(snapshot):
+                              raise RuntimeError("The bot did not save a complete state snapshot")
+                          snapshot["workflow_delayed_retries"] = retry_snapshot
+                          raw = json.dumps(snapshot, indent=4).encode("utf-8")
+                          temporary.write_bytes(raw)
+                          os.replace(temporary, state)
+                          receipt.write_text(hashlib.sha256(raw).hexdigest(), encoding="ascii")
+                      finally:
+                          namespace["STATE_FILE"] = original_path
+                          temporary.unlink(missing_ok=True)
+
+              async def flush_and_close():
+                  nonlocal closing
+                  closing = True
+                  # Stop the new queue dispatcher before cancelling pollers; a
+                  # poller's finally block must not launch work during shutdown.
+                  client.shutdown_requested = True
+                  try:
+                      if initialized:
+                          loops = [namespace.get(name) for name in (
+                              "poll_github_runs", "cleanup_expired_exclusions", "upload_logs"
+                          )]
+                          loops.append(getattr(client, "update_bot_status", None))
+                          pending = []
+                          for loop in loops:
+                              if loop is not None:
+                                  task = loop.get_task()
+                                  if task is not None and task is not asyncio.current_task():
+                                      loop.cancel()
+                                      pending.append(task)
+                          if pending:
+                              await asyncio.gather(*pending, return_exceptions=True)
+                          waiting_tasks = [task for task in (
+                              retry_tasks | set(getattr(client, "dispatch_tasks", ()))
+                          ) if task is not asyncio.current_task()]
+                          for task in waiting_tasks:
+                              task.cancel()
+                          if waiting_tasks:
+                              await asyncio.gather(*waiting_tasks, return_exceptions=True)
+                          await save_state()
+                          logging.info("Bot state saved for the next workflow session")
+                  finally:
+                      await close_original()
+
+              async def close():
+                  nonlocal close_done
+                  if close_done is not None:
+                      await asyncio.shield(close_done)
+                      return
+                  close_done = asyncio.get_running_loop().create_future()
+                  try:
+                      # Stay in the caller's task: the existing /restart must reach
+                      # os.execv before discord.py finishes shutting down its loop
+                      await flush_and_close()
+                  except BaseException as error:
+                      close_done.set_exception(error)
+                      close_done.exception()  # Mark retrieved even without a second caller
+                      raise
+                  else:
+                      close_done.set_result(None)
+
+              client.load_state = load_state
+              client.save_state = save_state
+              client.close = close
+              namespace["schedule_timeout_retry"] = schedule_timeout_retry
+              client._workflow_cancel_retries = cancel_workflow_retries
+              client._workflow_hooks_installed = True
+              return client
+
+
+          script = Path(sys.argv[1]).resolve()
+          tree = ast.parse(script.read_text(encoding="utf-8-sig"), filename=str(script))
+          # Find the actual startup call, including a __main__ guard or main()
+          # function, install hooks on its receiver immediately before it runs
+          startup_calls = [node for node in ast.walk(tree) if (
+              isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "run" and isinstance(node.func.value, ast.Name)
+              and node.func.value.id == "client"
+          )]
+          if not startup_calls:
+              raise SystemExit(f"No client.run(...) startup call was found in {script.name}, check the python_file input and ZIP contents")
+          for call in startup_calls:
+              call.func.value = ast.Call(
+                  func=ast.Name(id="_workflow_prepare_client", ctx=ast.Load()),
+                  args=[call.func.value], keywords=[]
+              )
+          ast.fix_missing_locations(tree)
+          module = types.ModuleType("__main__")
+          module.__file__ = str(script)
+          module.__dict__["_workflow_prepare_client"] = install_workflow_hooks
+          sys.modules["__main__"] = module
+          sys.path.insert(0, str(script.parent))
+          # Keep sys.argv pointing to this launcher, so the bot's existing os.execv()
+          # restart reloads these shutdown hooks as well as the original bot
+          exec(compile(tree, str(script), "exec"), module.__dict__)
+          PY
+
+      - name: Run Arab News Archive Bot session
+        id: run
+        env:
+          ARAB_NEWS_DISCORD_TOKEN: ${{ secrets.ARAB_NEWS_DISCORD_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID || vars.OWNER_ID }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_OWNER: ${{ env.ARCHIVE_TARGET_OWNER }}
+          GITHUB_REPO: ${{ env.ARCHIVE_TARGET_REPO }}
+          ARAB_NEWS_LOG_CHANNEL_ID: ${{ secrets.ARAB_NEWS_LOG_CHANNEL_ID || vars.ARAB_NEWS_LOG_CHANNEL_ID }}
+          WORKFLOW_STATE_RECEIPT: ${{ runner.temp }}/arab-news-bot-state-receipt
+          WORKFLOW_RESTART_FILE: ${{ runner.temp }}/arab-news-bot-restart-request
+          WORKFLOW_UPLOAD_FILE: ${{ runner.temp }}/arab-news-bot-upload-request
+          WORKFLOW_SHUTDOWN_FILE: ${{ runner.temp }}/arab-news-bot-shutdown-request
+        run: |
+          set -Eeuo pipefail
+          "$RUNNER_TEMP/arab-news-bot-venv/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          import hashlib
+          import signal
+          import sqlite3
+          import subprocess
+          import sys
+          import time
+
+          app = Path(os.environ["GITHUB_WORKSPACE"]) / "arab-news-archive-app"
+          script = (app / os.environ["PYTHON_FILE"].replace("\\", "/")).resolve()
+          restart_file = Path(os.environ["WORKFLOW_RESTART_FILE"])
+          upload_file = Path(os.environ["WORKFLOW_UPLOAD_FILE"])
+          shutdown_file = Path(os.environ["WORKFLOW_SHUTDOWN_FILE"])
+          for marker in (restart_file, upload_file, shutdown_file):
+              marker.unlink(missing_ok=True)
+
+          cancelled = False
+          def request_stop(signum, frame):
+              global cancelled
+              cancelled = True
+          signal.signal(signal.SIGINT, request_stop)
+          signal.signal(signal.SIGTERM, request_stop)
+
+          child = subprocess.Popen(
+              [sys.executable, "-u", str(Path(os.environ["RUNNER_TEMP"]) / "arab-news-workflow-launcher.py"), str(script)], cwd=app,
+              stdin=subprocess.DEVNULL, start_new_session=True
+          )
+          session_seconds = int(os.environ["SESSION_SECONDS"])
+          deadline = time.monotonic() + session_seconds
+          reason = "script-exited"
+          forced = False
+          upload_requested = False
+          shutdown_requested = False
+
+          def send_group(sig):
+              try:
+                  os.killpg(child.pid, sig)
+              except ProcessLookupError:
+                  pass
+
+          hours, remainder = divmod(session_seconds, 3600)
+          minutes, seconds = divmod(remainder, 60)
+          print(f"Arab News Archive Bot session started, maximum duration is {hours}:{minutes:02d}:{seconds:02d}", flush=True)
+          try:
+              while True:
+                  if cancelled:
+                      reason = "cancelled"
+                      break
+                  if shutdown_file.exists():
+                      shutdown_requested = True
+                      reason = "shutdown-request"
+                      break
+                  if upload_file.exists():
+                      upload_requested = True
+                      reason = "upload-request"
+                      break
+                  if restart_file.exists():
+                      reason = "restart-request"
+                      break
+                  if child.poll() is not None:
+                      break
+                  if time.monotonic() >= deadline:
+                      reason = "time-limit"
+                      break
+                  time.sleep(1)
+
+              if child.poll() is None:
+                  print("Sending Ctrl+C, waiting up to 120 seconds for shutdown", flush=True)
+                  send_group(signal.SIGINT)
+                  try:
+                      child.wait(timeout=120)
+                  except subprocess.TimeoutExpired:
+                      forced = True
+                      print("::error::Python did not stop within 120 seconds", flush=True)
+                      send_group(signal.SIGKILL)
+                      child.wait(timeout=10)
+              code = child.returncode
+          finally:
+              # Clean up any remaining subprocesses belonging to this application
+              send_group(signal.SIGKILL)
+              child.wait(timeout=10)
+              # Honor a shutdown request received while the child was closing
+              if shutdown_file.exists():
+                  shutdown_requested = True
+                  if not cancelled:
+                      reason = "shutdown-request"
+              for marker in (restart_file, upload_file, shutdown_file):
+                  marker.unlink(missing_ok=True)
+
+          planned_stop = reason in {"time-limit", "restart-request", "upload-request", "shutdown-request"}
+          expected_exit = code == 0 or (planned_stop and code in {-signal.SIGINT, 130})
+          ok = expected_exit and not forced and not cancelled
+          if ok:
+              try:
+                  state = app / "arab_news_bot_state.json"
+                  receipt = Path(os.environ["WORKFLOW_STATE_RECEIPT"])
+                  digest = hashlib.sha256(state.read_bytes()).hexdigest()
+                  if receipt.read_text(encoding="ascii") != digest:
+                      raise RuntimeError("Bot state was not saved by this session")
+                  for filename in ("arab_news_archive.db", "arab_news_excluded_urls.db"):
+                      path = app / filename
+                      if not path.is_file():
+                          raise RuntimeError("Missing bot database: " + filename)
+                      with sqlite3.connect(str(path), timeout=30) as database:
+                          checkpoint = database.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                          if checkpoint[0] != 0:
+                              raise RuntimeError("Database is still busy: " + filename)
+                          if database.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                              raise RuntimeError("Database validation failed: " + filename)
+              except Exception as error:
+                  print(f"::error::State validation failed: {error}", flush=True)
+                  ok = False
+          cache_safe = ok
+          print(f"Session ended: {reason}, script exit code: {code}", flush=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"cache_safe={str(cache_safe).lower()}\n")
+              output.write(f"ok={str(ok).lower()}\n")
+              output.write(f"upload_requested={str(upload_requested).lower()}\n")
+              output.write(f"shutdown_requested={str(shutdown_requested).lower()}\n")
+          if shutdown_requested:
+              print("Owner requested shutdown, automatic continuation is disabled", flush=True)
+          if not ok:
+              print("::error::Session failed or was interrupted, no new session will start")
+              sys.exit(1)
+          PY
+
+      - name: Save application files and data
+        if: ${{ !cancelled() && steps.run.outputs.cache_safe == 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: |
+            arab-news-archive-app
+            !arab-news-archive-app/.env
+            !arab-news-archive-app/.env.*
+            !arab-news-archive-app/.venv
+            !arab-news-archive-app/venv
+            !arab-news-archive-app/**/__pycache__
+          key: arab-news-bot-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Back up to R2 and remove previous backups
+        if: ${{ !cancelled() && steps.run.outputs.ok == 'true' }}
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+        run: |
+          set -Eeuo pipefail
+          python -m venv "$RUNNER_TEMP/python-backup-venv"
+          BACKUP_PYTHON="$RUNNER_TEMP/python-backup-venv/bin/python"
+          "$BACKUP_PYTHON" -m pip install boto3
+          "$BACKUP_PYTHON" - <<'PY'
+          from contextlib import closing
+          from datetime import datetime, timezone
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import zipfile
+          import boto3
+          from boto3.s3.transfer import TransferConfig
+          from botocore.config import Config
+
+          required = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ACCOUNT_ID", "R2_BUCKET_NAME")
+          missing = [name for name in required if not os.environ.get(name, "").strip()]
+          if missing:
+              raise SystemExit("Missing R2 configuration: " + ", ".join(missing))
+          stamp = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
+          archive_name = f"arab-news-bot_{stamp}_{os.environ['GITHUB_RUN_ID']}_{os.environ['GITHUB_RUN_ATTEMPT']}.zip"
+          archive = Path(os.environ["RUNNER_TEMP"]) / archive_name
+          app = Path(os.environ["GITHUB_WORKSPACE"]) / "arab-news-archive-app"
+          excluded = {".git", ".venv", "venv", "__pycache__", ".pytest_cache"}
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+              for folder, dirs, files in os.walk(app, followlinks=False):
+                  dirs[:] = [name for name in dirs if name not in excluded and not (Path(folder) / name).is_symlink()]
+                  for name in files:
+                      path = Path(folder) / name
+                      if path.is_file() and not path.is_symlink() and name != ".env" and not name.startswith(".env."):
+                          zf.write(path, path.relative_to(app).as_posix())
+          client = boto3.client(
+              "s3", endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+              aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"], region_name="auto",
+              config=Config(request_checksum_calculation="when_required", response_checksum_validation="when_required")
+          )
+          bucket = os.environ["R2_BUCKET_NAME"]
+          # Keep each repository, workflow file and branch in its own backup folder
+          scope = hashlib.sha256(os.environ["GITHUB_WORKFLOW_REF"].encode("utf-8")).hexdigest()[:16]
+          prefix = f"arab-news-bot-backups/{os.environ['GITHUB_REPOSITORY']}/{scope}/"
+          key = prefix + archive_name
+          managed_name = re.compile(re.escape(prefix) + r"arab-news-bot_\d{4}(?:_\d{2}){5}_\d+_\d+\.zip")
+
+          # Snapshot existing managed ZIPs before uploading, never delete unrelated keys
+          previous_keys = []
+          for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+              for entry in page.get("Contents", []):
+                  previous_key = entry["Key"]
+                  if previous_key != key and managed_name.fullmatch(previous_key):
+                      previous_keys.append(previous_key)
+
+          with archive.open("rb") as source:
+              local_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+          local_size = archive.stat().st_size
+          client.upload_file(
+              str(archive), bucket, key,
+              ExtraArgs={"ContentType": "application/zip", "Metadata": {"sha256": local_sha256}},
+              Config=TransferConfig(preferred_transfer_client="classic")
+          )
+
+          # Read the uploaded bytes back and verify them before removing any older ZIP
+          response = client.get_object(Bucket=bucket, Key=key)
+          remote_sha256 = hashlib.sha256()
+          received = 0
+          with closing(response["Body"]) as body:
+              if response["ContentLength"] != local_size:
+                  raise SystemExit("R2 backup size verification failed, previous backups were kept")
+              for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                  remote_sha256.update(chunk)
+                  received += len(chunk)
+          if received != local_size or remote_sha256.hexdigest() != local_sha256:
+              raise SystemExit("R2 backup SHA-256 verification failed, previous backups were kept")
+          print(f"Backup uploaded and verified: {key}")
+
+          for previous_key in previous_keys:
+              client.delete_object(Bucket=bucket, Key=previous_key)
+              print(f"Deleted previous backup: {previous_key}")
+          archive.unlink()
+          print(f"R2 backup complete, removed {len(previous_keys)} previous backup(s)")
+          PY
+
+      - name: Confirm saved cache and prune old entries
+        if: ${{ !cancelled() && steps.run.outputs.cache_safe == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_PREFIX: arab-news-bot-${{ runner.os }}-${{ github.ref_name }}-
+          CURRENT_KEY: arab-news-bot-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          gh api --paginate --method GET \
+            "/repos/$GITHUB_REPOSITORY/actions/caches" \
+            -f key="$CACHE_PREFIX" -f ref="$GITHUB_REF" -f per_page=100 \
+            > "$RUNNER_TEMP/arab-news-bot-caches.json"
+
+          if ! jq -se --arg key "$CURRENT_KEY" \
+            '[.[].actions_caches[]] | any(.key == $key)' \
+            "$RUNNER_TEMP/arab-news-bot-caches.json" > /dev/null; then
+            echo "::error::New app cache was not found, keeping all existing caches and stopping continuation"
+            exit 1
+          fi
+
+          # Keep the newly saved cache plus one previous version, only on this ref
+          jq -sr --arg key "$CURRENT_KEY" --arg prefix "$CACHE_PREFIX" \
+            '[.[].actions_caches[] | select((.key | startswith($prefix)) and .key != $key)]
+             | sort_by(.created_at) | reverse | .[1:][] | .id' \
+            "$RUNNER_TEMP/arab-news-bot-caches.json" > "$RUNNER_TEMP/arab-news-bot-old-cache-ids"
+          while IFS= read -r cache_id; do
+            gh api --method DELETE "/repos/$GITHUB_REPOSITORY/actions/caches/$cache_id" || \
+              echo "::warning::Could not delete old cache $cache_id"
+          done < "$RUNNER_TEMP/arab-news-bot-old-cache-ids"
+
+      - name: Start next bot session
+        if: ${{ success() && steps.run.outputs.ok == 'true' && steps.run.outputs.shutdown_requested != 'true' && inputs.continue }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_PYTHON_VERSION: ${{ inputs.python_version }}
+        run: |
+          set -Eeuo pipefail
+          WORKFLOW_ID="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id')"
+          jq -n \
+            --arg ref "$GITHUB_REF_NAME" \
+            --arg filename "$PYTHON_FILE" \
+            --arg version "$NEXT_PYTHON_VERSION" \
+            '{ref: $ref, inputs: {continue: "true", force_reimport: "false", update_python_file: "false",
+              python_file: $filename, python_version: $version}}' \
+            > "$RUNNER_TEMP/arab-news-bot-next-session.json"
+          gh api --method POST \
+            "/repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/dispatches" \
+            --input "$RUNNER_TEMP/arab-news-bot-next-session.json"
+          echo "Next bot session queued"
