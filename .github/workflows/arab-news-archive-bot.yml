@@ -377,7 +377,9 @@ jobs:
                               True,  # Reuse the saved status message
                               job.get("ignore_existing_item", True)
                           )
-                          if job.get("bot_retry_count"):
+                          if job.get("spn_series"):
+                              queued_job += (job.get("bot_retry_count", 0), job["spn_series"])
+                          elif job.get("bot_retry_count"):
                               queued_job += (job["bot_retry_count"],)
                           client.queued_jobs[user_id].append(queued_job)
                           # Queue insertion and timer removal are one snapshot change,
@@ -433,6 +435,7 @@ jobs:
                           "is_bot_request": context.get("is_bot_request", False),
                           "ignore_existing_item": context.get("ignore_existing_item", False),
                           "bot_retry_count": context.get("bot_retry_count", 0),
+                          "spn_series": context.get("spn_series"),
                           "message_data": {
                               "channel_id": message.channel.id, "message_id": message.id
                           } if message else None
