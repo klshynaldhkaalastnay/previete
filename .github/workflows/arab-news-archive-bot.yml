@@ -349,8 +349,7 @@ jobs:
                       record = delayed_retries.get(retry_id)
                       if record is None:
                           return
-                      # UTC timestamps retain elapsed offline time, never restart a
-                      # two-hour wait merely because the bot or workflow restarted
+                      # Keep the original deadline when a workflow session restarts.
                       while record["due_at"] > time.time():
                           await asyncio.sleep(min(record["due_at"] - time.time(), 60))
                       if closing:
@@ -378,6 +377,8 @@ jobs:
                               True,  # Reuse the saved status message
                               job.get("ignore_existing_item", True)
                           )
+                          if job.get("bot_retry_count"):
+                              queued_job += (job["bot_retry_count"],)
                           client.queued_jobs[user_id].append(queued_job)
                           # Queue insertion and timer removal are one snapshot change,
                           # so a restart cannot restore this as both queued and waiting
@@ -413,14 +414,14 @@ jobs:
                       record["job"]["batch_id"] for record in removed if record["job"].get("batch_id")
                   ]}
 
-              def schedule_timeout_retry(context):
+              def schedule_delayed_retry(context, delay_seconds):
                   # Register synchronously, before create_task() starts the coroutine
                   # This also covers a shutdown immediately after the timer is scheduled
                   retry_id = uuid.uuid4().hex
                   message = context.get("status_msg")
                   delayed_retries[retry_id] = {
                       "id": retry_id,
-                      "due_at": time.time() + namespace["JOB_RETRY_DELAY_SECONDS"],
+                      "due_at": time.time() + delay_seconds,
                       "job": {
                           "user_id": context["user_id"],
                           "target_url": context["target_url"],
@@ -430,7 +431,8 @@ jobs:
                           "free_space": context.get("free_space", False),
                           "batch_id": context.get("batch_id"),
                           "is_bot_request": context.get("is_bot_request", False),
-                          "ignore_existing_item": True,
+                          "ignore_existing_item": context.get("ignore_existing_item", False),
+                          "bot_retry_count": context.get("bot_retry_count", 0),
                           "message_data": {
                               "channel_id": message.channel.id, "message_id": message.id
                           } if message else None
@@ -583,7 +585,14 @@ jobs:
               client.load_state = load_state
               client.save_state = save_state
               client.close = close
-              namespace["schedule_timeout_retry"] = schedule_timeout_retry
+              if "schedule_delayed_retry" in namespace:
+                  namespace["schedule_delayed_retry"] = schedule_delayed_retry
+              else:
+                  def schedule_timeout_retry(context):
+                      return schedule_delayed_retry(
+                          {**context, "ignore_existing_item": True}, namespace["JOB_RETRY_DELAY_SECONDS"],
+                      )
+                  namespace["schedule_timeout_retry"] = schedule_timeout_retry
               client._workflow_cancel_retries = cancel_workflow_retries
               client._workflow_hooks_installed = True
               return client
