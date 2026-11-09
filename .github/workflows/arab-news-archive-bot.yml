@@ -305,6 +305,8 @@ jobs:
               load_original = client.load_state
               close_original = client.close
               namespace = save_original.__func__.__globals__
+              archive_queue_key = namespace.get("archive_queue_key", lambda user_id, series=None: user_id)
+              queue_is_paused = getattr(client, "queue_is_paused", lambda user_id: False)
               state = Path(namespace["STATE_FILE"]).resolve()
               receipt = Path(os.environ["WORKFLOW_STATE_RECEIPT"])
               receipt.unlink(missing_ok=True)
@@ -327,15 +329,15 @@ jobs:
                   if closing:
                       return
                   await client.wait_until_ready()
-                  for user_id in list(client.queued_jobs):
-                      while (not closing and client.queued_jobs[user_id]
-                             and client.active_jobs[user_id] < namespace["MAX_CONCURRENT_JOBS"]):
+                  for queue_key in list(client.queued_jobs):
+                      while (not closing and client.queued_jobs[queue_key]
+                             and client.active_jobs[queue_key] < namespace["MAX_CONCURRENT_JOBS"]):
                           async with save_lock:
                               if closing:
                                   return
-                              queued_before = len(client.queued_jobs[user_id])
-                              await namespace["check_and_process_queue"](user_id)
-                              if len(client.queued_jobs[user_id]) >= queued_before:
+                              queued_before = len(client.queued_jobs[queue_key])
+                              await namespace["check_and_process_queue"](queue_key)
+                              if len(client.queued_jobs[queue_key]) >= queued_before:
                                   break
 
               async def run_delayed_retry(retry_id):
@@ -367,8 +369,9 @@ jobs:
                           except Exception as error:
                               logging.warning("Could not restore delayed retry's status message: %s", error)
                       user_id = job["user_id"]
+                      queue_key = archive_queue_key(user_id, job.get("spn_series"))
                       async with save_lock:
-                          if closing or retry_id not in delayed_retries:
+                          if closing or retry_id not in delayed_retries or queue_is_paused(user_id):
                               return
                           queued_job = (
                               job["target_url"], job["url_type"], job["is_silent"], message,
@@ -381,13 +384,13 @@ jobs:
                               queued_job += (job.get("bot_retry_count", 0), job["spn_series"])
                           elif job.get("bot_retry_count"):
                               queued_job += (job["bot_retry_count"],)
-                          client.queued_jobs[user_id].append(queued_job)
+                          client.queued_jobs[queue_key].append(queued_job)
                           # Queue insertion and timer removal are one snapshot change,
                           # so a restart cannot restore this as both queued and waiting
                           delayed_retries.pop(retry_id)
                           retry_messages.pop(retry_id, None)
-                          if client.active_jobs[user_id] < namespace["MAX_CONCURRENT_JOBS"]:
-                              await namespace["check_and_process_queue"](user_id)
+                          if client.active_jobs[queue_key] < namespace["MAX_CONCURRENT_JOBS"]:
+                              await namespace["check_and_process_queue"](queue_key)
                   except asyncio.CancelledError:
                       # Shutdown cancels the sleep, its saved record remains intact
                       raise
@@ -482,13 +485,14 @@ jobs:
                           for trace, context in expected_pending.items()
                       ):
                           raise RuntimeError("The bot could not restore pending requests, keeping the prior cache")
-                      expected_queues = {
-                          int(user): [(job["user_id"], job["target_url"]) for job in jobs]
-                          for user, jobs in snapshot.get("queued_jobs", {}).items() if jobs
-                      }
+                      expected_queues = {}
+                      for user, jobs in snapshot.get("queued_jobs", {}).items():
+                          for job in jobs:
+                              queue_key = archive_queue_key(int(user), job.get("spn_series"))
+                              expected_queues.setdefault(queue_key, []).append((job["user_id"], job["target_url"]))
                       actual_queues = {
-                          int(user): [(job[5], job[0]) for job in jobs]
-                          for user, jobs in client.queued_jobs.items() if jobs
+                          queue_key: [(job[5], job[0]) for job in jobs]
+                          for queue_key, jobs in client.queued_jobs.items() if jobs
                       }
                       if actual_queues != expected_queues:
                           raise RuntimeError("The bot could not restore queued requests, keeping the prior cache")
