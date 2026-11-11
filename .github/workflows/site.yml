@@ -118,7 +118,7 @@ jobs:
           PY
       - name: Validate archive and tunnel settings
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT_SITE }}
           ARCHIVE_REPOSITORY: ${{ vars.ARCHIVE_REPOSITORY }}
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
           SITE_URL: ${{ vars.SITE_URL }}
