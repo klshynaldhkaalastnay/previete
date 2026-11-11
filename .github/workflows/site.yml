@@ -50,7 +50,7 @@ jobs:
             video-site-${{ runner.os }}-${{ github.ref_name }}-
       - name: Import the application ZIP
         env:
-          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
+          APP_ZIP_URL: ${{ secrets.SITE_ZIP_URL }}
           APP_ZIP_FOLDER: ${{ vars.APP_ZIP_FOLDER }}
           FORCE_REIMPORT: ${{ inputs.force_reimport }}
         run: |
