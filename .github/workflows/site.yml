@@ -1,0 +1,222 @@
+name: Host Video Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      continue:
+        description: Start the next hosting session after saving state
+        type: boolean
+        required: true
+        default: true
+      force_reimport:
+        description: Refresh the app ZIP while preserving site data
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: video-archive-host
+  cancel-in-progress: false
+
+env:
+  SESSION_SECONDS: '19800'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  site:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@main
+        with:
+          python-version: '3.x'
+      - name: Restore app and site data
+        uses: actions/cache/restore@main
+        with:
+          path: app
+          key: video-site-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            video-site-${{ runner.os }}-${{ github.ref_name }}-
+      - name: Import the application ZIP
+        env:
+          APP_ZIP_URL: ${{ secrets.APP_ZIP_URL }}
+          APP_ZIP_FOLDER: ${{ vars.APP_ZIP_FOLDER }}
+          FORCE_REIMPORT: ${{ inputs.force_reimport }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import tempfile
+          from urllib.request import urlopen
+          import zipfile
+
+          app = Path(os.environ['GITHUB_WORKSPACE']) / 'app'
+          if (app / 'run_session.py').is_file() and os.environ['FORCE_REIMPORT'] != 'true':
+              print('Restored the application and saved site data')
+              raise SystemExit
+          url = os.environ.get('APP_ZIP_URL', '').strip()
+          if not url.startswith('https://'):
+              raise SystemExit('Set APP_ZIP_URL to the direct HTTPS download URL of github-video-archive.zip')
+          with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as temporary:
+              temporary = Path(temporary)
+              archive = temporary / 'app.zip'
+              with urlopen(url, timeout=60) as source, archive.open('wb') as output:
+                  shutil.copyfileobj(source, output)
+              selected = PurePosixPath(os.environ.get('APP_ZIP_FOLDER', '').strip().strip('/'))
+              if selected.is_absolute() or '..' in selected.parts:
+                  raise SystemExit('APP_ZIP_FOLDER must be a relative folder inside the ZIP')
+              staged = temporary / 'staged'
+              staged.mkdir()
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  if sum(entry.file_size for entry in entries) > 100 * 1024**2:
+                      raise SystemExit('The application ZIP exceeds the 100 MiB extracted-code limit')
+                  for entry in entries:
+                      path = PurePosixPath(entry.filename)
+                      if path.is_absolute() or '..' in path.parts or '\\' in entry.filename:
+                          raise SystemExit('Unsafe path in the application ZIP')
+                      if selected.parts and path.parts[:len(selected.parts)] != selected.parts:
+                          continue
+                      relative = PurePosixPath(*path.parts[len(selected.parts):])
+                      if not relative.parts or relative.parts[0] in {'data', '.git', '.env', '__pycache__'}:
+                          continue
+                      mode = entry.external_attr >> 16
+                      if stat.S_ISLNK(mode):
+                          raise SystemExit('Symbolic links are not supported in the application ZIP')
+                      destination = staged.joinpath(*relative.parts)
+                      if entry.is_dir():
+                          destination.mkdir(parents=True, exist_ok=True)
+                      else:
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          with bundle.open(entry) as source, destination.open('wb') as output:
+                              shutil.copyfileobj(source, output)
+              for name in ('run_session.py', 'site_server.py', 'scripts/archive_video.py', 'site/index.html'):
+                  if not (staged / name).is_file():
+                      raise SystemExit('Missing ' + name + ', set APP_ZIP_FOLDER if the ZIP has a containing folder')
+              app.mkdir(exist_ok=True)
+              for path in app.iterdir():
+                  if path.name != 'data':
+                      if path.is_dir() and not path.is_symlink():
+                          shutil.rmtree(path)
+                      else:
+                          path.unlink()
+              shutil.copytree(staged, app, dirs_exist_ok=True)
+          print('Imported the application while preserving saved site data')
+          PY
+      - name: Validate archive and tunnel settings
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ARCHIVE_REPOSITORY: ${{ vars.ARCHIVE_REPOSITORY }}
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          if not os.environ.get('GH_PAT', '').strip():
+              raise SystemExit('Add GH_PAT with Contents read/write access to the separate archive repository')
+          repository = os.environ.get('ARCHIVE_REPOSITORY', '').strip()
+          if not re.fullmatch(r'[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+', repository):
+              raise SystemExit('Set the ARCHIVE_REPOSITORY variable to owner/repo')
+          if repository.lower() == os.environ['GITHUB_REPOSITORY'].lower():
+              raise SystemExit('ARCHIVE_REPOSITORY must be different from the hosting repository')
+          if os.environ.get('TUNNEL_TOKEN') and not re.fullmatch(r'https://[A-Za-z0-9.-]+/?', os.environ.get('SITE_URL', '')):
+              raise SystemExit('Set SITE_URL to the named tunnel HTTPS origin')
+          PY
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@main
+      - name: Restore dependency downloads
+        uses: actions/cache@main
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.bun/install/cache
+          key: video-site-dependencies-${{ runner.os }}
+      - name: Install the server and download tools
+        run: |
+          set -euo pipefail
+          python -m pip install aiohttp
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          curl --fail --location --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output "$RUNNER_TEMP/cloudflared"
+          chmod 700 "$RUNNER_TEMP/cloudflared"
+      - name: Prepare PreserveTube metadata and Companion
+        run: python app/scripts/setup_metadata.py
+      - name: Run website and archive worker
+        id: run
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ARCHIVE_REPOSITORY: ${{ vars.ARCHIVE_REPOSITORY }}
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL }}
+          SITE_ARCHIVE_KEY: ${{ secrets.SITE_ARCHIVE_KEY }}
+        run: |
+          export CLOUDFLARED="$RUNNER_TEMP/cloudflared"
+          python app/run_session.py
+      - name: Save app and site data
+        if: ${{ always() && steps.run.outputs.cache_safe == 'true' }}
+        uses: actions/cache/save@main
+        with:
+          path: |
+            app
+            !app/**/__pycache__
+          key: video-site-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify the saved state and keep two recent caches
+        if: ${{ success() && steps.run.outputs.ok == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_PREFIX: video-site-${{ runner.os }}-${{ github.ref_name }}-
+          CURRENT_KEY: video-site-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          repository = os.environ['GITHUB_REPOSITORY']
+          response = subprocess.check_output([
+              'gh', 'api', '--paginate', '--slurp', '--method', 'GET',
+              f'repos/{repository}/actions/caches', '-f', 'key=' + os.environ['CACHE_PREFIX'],
+              '-f', 'ref=' + os.environ['GITHUB_REF'], '-f', 'per_page=100',
+          ], text=True)
+          caches = [cache for page in json.loads(response) for cache in page['actions_caches']]
+          current = os.environ['CURRENT_KEY']
+          if not any(cache['key'] == current for cache in caches):
+              raise SystemExit('The new site cache was not found, continuation stopped')
+          older = sorted((cache for cache in caches if cache['key'] != current), key=lambda cache: cache['created_at'], reverse=True)
+          for cache in older[1:]:
+              subprocess.run(['gh', 'api', '--method', 'DELETE', f"repos/{repository}/actions/caches/{cache['id']}"])
+          PY
+      - name: Start the next website session
+        if: ${{ success() && steps.run.outputs.ok == 'true' && inputs.continue }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          repository = os.environ['GITHUB_REPOSITORY']
+          run = json.loads(subprocess.check_output(['gh', 'api', f"repos/{repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}"], text=True))
+          payload = {'ref': os.environ['GITHUB_REF_NAME'], 'inputs': {'continue': True, 'force_reimport': False}}
+          subprocess.run([
+              'gh', 'api', '--method', 'POST', f"repos/{repository}/actions/workflows/{run['workflow_id']}/dispatches", '--input', '-',
+          ], input=json.dumps(payload), text=True, check=True)
+          print('The next website session is queued')
+          PY
