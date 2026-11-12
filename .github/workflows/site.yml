@@ -116,12 +116,10 @@ jobs:
               shutil.copytree(staged, app, dirs_exist_ok=True)
           print('Imported the application while preserving saved site data')
           PY
-      - name: Validate archive and tunnel settings
+      - name: Validate archive settings
         env:
           GH_PAT: ${{ secrets.GH_PAT_SITE }}
           ARCHIVE_REPOSITORY: ${{ vars.ARCHIVE_REPOSITORY }}
-          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          SITE_URL: ${{ vars.SITE_URL }}
         run: |
           python - <<'PY'
           import os
@@ -133,8 +131,6 @@ jobs:
               raise SystemExit('Set the ARCHIVE_REPOSITORY variable to owner/repo')
           if repository.lower() == os.environ['GITHUB_REPOSITORY'].lower():
               raise SystemExit('ARCHIVE_REPOSITORY must be different from the hosting repository')
-          if os.environ.get('TUNNEL_TOKEN') and not re.fullmatch(r'https://[A-Za-z0-9.-]+/?', os.environ.get('SITE_URL', '')):
-              raise SystemExit('Set SITE_URL to the named tunnel HTTPS origin')
           PY
       - name: Set up Bun
         uses: oven-sh/setup-bun@main
@@ -164,8 +160,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           ARCHIVE_REPOSITORY: ${{ vars.ARCHIVE_REPOSITORY }}
-          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          SITE_URL: ${{ vars.SITE_URL }}
           SITE_ARCHIVE_KEY: ${{ secrets.SITE_ARCHIVE_KEY }}
         run: |
           export CLOUDFLARED="$RUNNER_TEMP/cloudflared"
